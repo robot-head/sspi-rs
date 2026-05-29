@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [[0.21.1](https://github.com/Devolutions/sspi-rs/compare/sspi-v0.21.0...sspi-v0.21.1)] - 2026-05-29
+
+### <!-- 1 -->Features
+
+- Add support for SECPKG_ATTR_NAMES ([#676](https://github.com/Devolutions/sspi-rs/issues/676)) ([be6315d475](https://github.com/Devolutions/sspi-rs/commit/be6315d475d7c4ce4c571220e2cfd7cb0881b7c7)) 
+
+### <!-- 4 -->Bug Fixes
+
+- Ntlm: NTLM_SSP_NEGOTIATE_KEY_EXCH flag usage ([#670](https://github.com/Devolutions/sspi-rs/issues/670)) ([a26a3692b0](https://github.com/Devolutions/sspi-rs/commit/a26a3692b029c5617f75a6dc618e5c7f78d3bc1b)) 
+
+- Package list handling ([#677](https://github.com/Devolutions/sspi-rs/issues/677)) ([ee75161bcd](https://github.com/Devolutions/sspi-rs/commit/ee75161bcdce0998b9173701129c0c7d607e1f17)) 
+
+- Disable `mechListMIC` for NTLM guest logon in negotiate module ([#680](https://github.com/Devolutions/sspi-rs/issues/680)) ([80bdedf387](https://github.com/Devolutions/sspi-rs/commit/80bdedf387da7341b95ff947d3bf68f48a0bc404)) 
+
+
+
 ## [[0.21.0](https://github.com/Devolutions/sspi-rs/compare/sspi-v0.20.1...sspi-v0.21.0)] - 2026-05-06
 
 ### <!-- 4 -->Bug Fixes
