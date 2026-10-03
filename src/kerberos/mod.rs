@@ -7,7 +7,7 @@ mod pa_datas;
 pub mod server;
 #[cfg(test)]
 mod tests;
-mod utils;
+pub(crate) mod utils;
 
 use std::fmt::Debug;
 use std::sync::LazyLock;
@@ -21,6 +21,7 @@ use picky_krb::gss_api::WrapToken;
 use picky_krb::messages::KdcProxyMessage;
 use rand::rngs::{StdRng, SysRng};
 use rand_core::{Rng as _, SeedableRng as _};
+use time::{Duration, OffsetDateTime};
 use url::Url;
 
 pub use self::client::initialize_security_context;
@@ -100,6 +101,8 @@ pub struct Kerberos {
     pub(crate) krb5_user_to_user: bool,
     pub(crate) server: Option<Box<ServerProperties>>,
     pub(crate) remote_seq_number: u32,
+    /// KDC time minus local time, learned from a clock-skew error during AS pre-authentication.
+    pub(crate) clock_offset: Duration,
 }
 
 impl Kerberos {
@@ -121,6 +124,7 @@ impl Kerberos {
             krb5_user_to_user: false,
             server: None,
             remote_seq_number: 0,
+            clock_offset: Duration::ZERO,
         })
     }
 
@@ -142,11 +146,18 @@ impl Kerberos {
             krb5_user_to_user: false,
             server: Some(Box::new(server_properties)),
             remote_seq_number: 0,
+            clock_offset: Duration::ZERO,
         })
     }
 
     pub fn is_client(&self) -> bool {
         self.server.is_none()
+    }
+
+    pub(crate) fn current_kdc_time(&self) -> Result<OffsetDateTime> {
+        OffsetDateTime::now_utc()
+            .checked_add(self.clock_offset)
+            .ok_or_else(|| Error::new(ErrorKind::TimeSkew, "KDC clock offset is out of range"))
     }
 
     pub fn config(&self) -> &KerberosConfig {
@@ -222,7 +233,8 @@ impl Kerberos {
                 yield_point.suspend(request).await
             }
             NetworkProtocol::Udp => {
-                if data.len() < 4 {
+                // First 4 bytes are message length and it’s not included when using UDP
+                let Some(data) = data.get(4..) else {
                     return Err(Error::new(
                         ErrorKind::InternalError,
                         format!(
@@ -230,13 +242,12 @@ impl Kerberos {
                             data.len()
                         ),
                     ));
-                }
+                };
 
-                // First 4 bytes are message length and it’s not included when using UDP
                 let request = NetworkRequest {
                     protocol,
                     url: kdc_url,
-                    data: data[4..].to_vec(),
+                    data: data.to_vec(),
                 };
                 yield_point.suspend(request).await
             }
@@ -778,7 +789,18 @@ impl SspiEx for Kerberos {
             .sub_session_key
             .as_ref()
             .ok_or_else(|| Error::new(ErrorKind::InternalError, "kerberos sub-session key is not set"))?;
-        utils::generate_mic_token(self.is_client(), u64::from(seq_number), data.to_vec(), session_key)
+        let aes_size = self
+            .encryption_params
+            .active_key_aes_size()
+            .or_else(|| self.encryption_params.aes_size())
+            .unwrap_or(AesSize::Aes256);
+        utils::generate_mic_token(
+            self.is_client(),
+            u64::from(seq_number),
+            data.to_vec(),
+            session_key,
+            &aes_size,
+        )
     }
 }
 
@@ -836,6 +858,7 @@ pub mod test_data {
             krb5_user_to_user: false,
             server: None,
             remote_seq_number: 0,
+            clock_offset: time::Duration::ZERO,
         }
     }
 
@@ -883,6 +906,7 @@ pub mod test_data {
             krb5_user_to_user: false,
             server: Some(Box::new(fake_server_properties())),
             remote_seq_number: 0,
+            clock_offset: time::Duration::ZERO,
         }
     }
 }

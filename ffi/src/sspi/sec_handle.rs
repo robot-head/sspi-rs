@@ -1,11 +1,15 @@
-use std::ffi::CStr;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::{CStr, c_ulonglong};
 use std::mem::size_of;
 use std::ptr::{self, NonNull, copy_nonoverlapping};
 use std::slice::from_raw_parts;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
-use libc::{c_ulonglong, c_void};
+use libc::c_void;
 use num_traits::{FromPrimitive, ToPrimitive};
+use sha2::{Digest, Sha256};
+#[cfg(feature = "scard")]
+use sspi::SmartCardType;
 use sspi::builders::ChangePasswordBuilder;
 use sspi::credssp::SspiContext;
 #[cfg(feature = "tsssp")]
@@ -32,6 +36,24 @@ cfg_if::cfg_if! {
     }
 }
 
+pub use ffi_types::sspi::{
+    AcquireCredentialsHandleFnA, AcquireCredentialsHandleFnW, AddCredentialsFnA, AddCredentialsFnW,
+    ChangeAccountPasswordFnA, ChangeAccountPasswordFnW, ImportSecurityContextFnA, ImportSecurityContextFnW,
+    InitializeSecurityContextFnA, InitializeSecurityContextFnW, PCredHandle, PCtxtHandle, QueryContextAttributesExFnA,
+    QueryContextAttributesExFnW, QueryContextAttributesFnA, QueryContextAttributesFnW, QueryCredentialsAttributesExFnA,
+    QueryCredentialsAttributesExFnW, QueryCredentialsAttributesFnA, QueryCredentialsAttributesFnW,
+    SECPKG_ATTR_CERT_TRUST_STATUS, SECPKG_ATTR_CONNECTION_INFO, SECPKG_ATTR_NAMES, SECPKG_ATTR_NEGOTIATION_INFO,
+    SECPKG_ATTR_NEGOTIATION_PACKAGE, SECPKG_ATTR_PACKAGE_INFO, SECPKG_ATTR_REMOTE_CERT_CONTEXT,
+    SECPKG_ATTR_SERVER_AUTH_FLAGS, SECPKG_ATTR_SESSION_KEY, SECPKG_ATTR_SIZES, SECPKG_ATTR_STREAM_SIZES,
+    SECPKG_NEGOTIATION_COMPLETE, SECPKG_NEGOTIATION_IN_PROGRESS, SECPKG_NEGOTIATION_OPTIMISTIC, SecHandle,
+    SetContextAttributesFnA, SetContextAttributesFnW, SetCredentialsAttributesFnA, SetCredentialsAttributesFnW,
+};
+use ffi_types::sspi::{
+    CertTrustStatus, LpStr, LpcWStr, PSecurityString, PTimeStamp, SecChar, SecGetKeyFn, SecPkgContextConnectionInfo,
+    SecPkgContextFlags, SecPkgContextNamesA, SecPkgContextNamesW, SecPkgContextSessionKey, SecPkgContextSizes,
+    SecPkgContextStreamSizes, SecWChar, SecurityStatus,
+};
+
 use super::credentials_attributes::{
     CredentialsAttributes, SecPkgCredentialsKdcUrlA, SecPkgCredentialsKdcUrlW, extract_kdc_proxy_settings,
 };
@@ -41,40 +63,8 @@ use super::sec_buffer::{
 };
 use super::sec_pkg_info::{RawSecPkgInfoA, RawSecPkgInfoW, SecNegoInfoA, SecNegoInfoW, SecPkgInfoA, SecPkgInfoW};
 use super::sec_winnt_auth_identity::auth_data_to_identity_buffers;
-use super::sspi_data_types::{
-    CertTrustStatus, LpStr, LpcWStr, PSecurityString, PTimeStamp, SecChar, SecGetKeyFn, SecPkgContextConnectionInfo,
-    SecPkgContextFlags, SecPkgContextNamesA, SecPkgContextNamesW, SecPkgContextSessionKey, SecPkgContextSizes,
-    SecPkgContextStreamSizes, SecWChar, SecurityStatus,
-};
-use super::utils::{hostname, transform_credentials_handle};
+use super::utils::{hostname, log_sec_handle};
 use crate::utils::into_raw_ptr;
-
-pub const SECPKG_NEGOTIATION_COMPLETE: u32 = 0;
-pub const SECPKG_NEGOTIATION_OPTIMISTIC: u32 = 1;
-pub const SECPKG_NEGOTIATION_IN_PROGRESS: u32 = 2;
-
-// the sizes of the structures used in the per-message functions and authentication exchanges
-pub const SECPKG_ATTR_SIZES: u32 = 0;
-// the name associated with the context
-pub const SECPKG_ATTR_NAMES: u32 = 1;
-// information about the security package to be used with the negotiation process and the current state of the negotiation for the use of that package
-pub const SECPKG_ATTR_NEGOTIATION_INFO: u32 = 12;
-// the sizes of the various parts of a stream used in the per-message functions
-pub const SECPKG_ATTR_STREAM_SIZES: u32 = 4;
-// certificate context that contains the end certificate supplied by the server
-pub const SECPKG_ATTR_REMOTE_CERT_CONTEXT: u32 = 0x53;
-// the name of the authentication package negotiated by the Microsoft Negotiate provider
-pub const SECPKG_ATTR_NEGOTIATION_PACKAGE: u32 = 0x80000081;
-// information on the SSP in use
-pub const SECPKG_ATTR_PACKAGE_INFO: u32 = 10;
-// information about the flags in the current security context
-pub const SECPKG_ATTR_SERVER_AUTH_FLAGS: u32 = 0x80000083;
-// trust information about the certificate
-pub const SECPKG_ATTR_CERT_TRUST_STATUS: u32 = 0x80000084;
-// detailed information on the established connection
-pub const SECPKG_ATTR_CONNECTION_INFO: u32 = 0x5a;
-// information about the session keys
-pub const SECPKG_ATTR_SESSION_KEY: u32 = 9;
 
 // Sets the name of a credential
 // In our library, we use this attribute to set the workstation for auth identity
@@ -84,15 +74,52 @@ const SECPKG_CRED_ATTR_KDC_PROXY_SETTINGS: u32 = 3;
 
 const SECPKG_CRED_ATTR_KDC_URL: u32 = 501;
 
-#[derive(Debug)]
-#[repr(C)]
-pub struct SecHandle {
-    pub dw_lower: c_ulonglong,
-    pub dw_upper: c_ulonglong,
+/// Identifies the security package a security context handle belongs to.
+///
+/// This value is written into the [SecHandle::dw_lower] field of every security context handle.
+/// Callers may compare it against the handle returned by a previous connection, so it must be the same
+/// for every context of a given package and stable for the whole process lifetime. Per-context
+/// state lives in [SecHandle::dw_upper] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityPackageId {
+    Ntlm,
+    Kerberos,
+    Negotiate,
+    Pku2u,
+    #[cfg(feature = "tsssp")]
+    CredSsp,
 }
 
-pub type PCredHandle = *mut SecHandle;
-pub type PCtxtHandle = *mut SecHandle;
+impl SecurityPackageId {
+    #[instrument(level = "debug", ret)]
+    pub fn from_package_name(package_name: &str) -> Result<Self> {
+        match package_name {
+            ntlm::PKG_NAME => Ok(Self::Ntlm),
+            kerberos::PKG_NAME => Ok(Self::Kerberos),
+            negotiate::PKG_NAME => Ok(Self::Negotiate),
+            pku2u::PKG_NAME => Ok(Self::Pku2u),
+            #[cfg(feature = "tsssp")]
+            sspi_cred_ssp::PKG_NAME => Ok(Self::CredSsp),
+            _ => Err(Error::new(
+                ErrorKind::SecurityPackageNotFound,
+                format!("security package name `{package_name}` is not supported"),
+            )),
+        }
+    }
+}
+
+impl From<SecurityPackageId> for c_ulonglong {
+    fn from(value: SecurityPackageId) -> Self {
+        match value {
+            SecurityPackageId::Ntlm => 1,
+            SecurityPackageId::Kerberos => 2,
+            SecurityPackageId::Negotiate => 3,
+            SecurityPackageId::Pku2u => 4,
+            #[cfg(feature = "tsssp")]
+            SecurityPackageId::CredSsp => 5,
+        }
+    }
+}
 
 /// Synchronized version of the [SspiContext].
 ///
@@ -224,10 +251,187 @@ impl Sspi for SspiHandle {
     }
 }
 
+#[derive(Clone)]
 pub struct CredentialsHandle {
     pub credentials: CredentialsBuffers,
     pub security_package_name: String,
     pub attributes: CredentialsAttributes,
+}
+
+impl CredentialsHandle {
+    fn fingerprint(&self, salt: &[u8; 32]) -> [u8; 32] {
+        fn add_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+            hasher.update(bytes.len().to_le_bytes());
+            hasher.update(bytes);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(salt);
+        add_bytes(&mut hasher, self.security_package_name.as_bytes());
+        match &self.credentials {
+            CredentialsBuffers::AuthIdentity(identity) => {
+                hasher.update([0]);
+                add_bytes(&mut hasher, identity.user.as_bytes_le());
+                add_bytes(&mut hasher, identity.domain.as_bytes_le());
+                add_bytes(&mut hasher, identity.password.as_ref().0.as_bytes_le());
+            }
+            #[cfg(feature = "scard")]
+            CredentialsBuffers::SmartCard(identity) => {
+                hasher.update([1]);
+                add_bytes(&mut hasher, identity.username.as_bytes_le());
+                add_bytes(&mut hasher, identity.certificate.as_ref());
+                for field in [&identity.card_name, &identity.container_name] {
+                    match field {
+                        Some(value) => {
+                            hasher.update([1]);
+                            add_bytes(&mut hasher, value.as_ref().as_bytes_le());
+                        }
+                        None => hasher.update([0]),
+                    }
+                }
+                add_bytes(&mut hasher, identity.reader_name.as_bytes_le());
+                add_bytes(&mut hasher, identity.csp_name.as_bytes_le());
+                add_bytes(&mut hasher, identity.pin.as_ref().0.as_bytes_le());
+                if let Some(key) = &identity.private_key_pem {
+                    hasher.update([1]);
+                    add_bytes(&mut hasher, key.as_ref().as_bytes_le());
+                } else {
+                    hasher.update([0]);
+                }
+                match &identity.scard_type {
+                    SmartCardType::Emulated { scard_pin } => {
+                        hasher.update([0]);
+                        add_bytes(&mut hasher, scard_pin.as_ref());
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    SmartCardType::SystemProvided { pkcs11_module_path } => {
+                        hasher.update([1]);
+                        add_bytes(&mut hasher, pkcs11_module_path.as_os_str().as_encoded_bytes());
+                    }
+                    #[cfg(target_os = "windows")]
+                    SmartCardType::WindowsNative => hasher.update([2]),
+                }
+            }
+            CredentialsBuffers::Keytab(identity) => {
+                hasher.update([2]);
+                add_bytes(&mut hasher, identity.principal.inner().as_bytes());
+                add_bytes(&mut hasher, identity.key.as_ref());
+                add_bytes(&mut hasher, format!("{:?}", identity.key_enctype).as_bytes());
+            }
+        }
+
+        hasher.finalize().into()
+    }
+}
+
+struct CredentialsEntry {
+    credentials: CredentialsHandle,
+    fingerprint: [u8; 32],
+}
+
+#[derive(Default)]
+struct CredentialsRegistry {
+    live: HashMap<c_ulonglong, CredentialsEntry>,
+    released: VecDeque<([u8; 32], c_ulonglong)>,
+    salt: Option<[u8; 32]>,
+    next_handle: c_ulonglong,
+}
+
+const MAX_RELEASED_CREDENTIALS: usize = 128;
+
+impl CredentialsRegistry {
+    fn register(&mut self, credentials: CredentialsHandle) -> Result<c_ulonglong> {
+        let salt = match self.salt {
+            Some(salt) => salt,
+            None => {
+                let mut salt = [0; 32];
+                getrandom::fill(&mut salt).map_err(|error| {
+                    Error::new(
+                        ErrorKind::InternalError,
+                        format!("Cannot seed credentials cache: {error}"),
+                    )
+                })?;
+                self.salt = Some(salt);
+                salt
+            }
+        };
+        let fingerprint = credentials.fingerprint(&salt);
+        let handle = if let Some(index) = self.released.iter().rposition(|(key, _)| key == &fingerprint) {
+            self.released
+                .remove(index)
+                .expect("index points to a released handle")
+                .1
+        } else {
+            self.next_handle = self
+                .next_handle
+                .checked_add(1)
+                .ok_or_else(|| Error::new(ErrorKind::InternalError, "credentials handle space exhausted"))?;
+            self.next_handle
+        };
+
+        self.live.insert(
+            handle,
+            CredentialsEntry {
+                credentials,
+                fingerprint,
+            },
+        );
+        Ok(handle)
+    }
+
+    fn release(&mut self, handle: c_ulonglong) -> bool {
+        let Some(entry) = self.live.remove(&handle) else {
+            return false;
+        };
+        if self.released.len() >= MAX_RELEASED_CREDENTIALS {
+            self.released.pop_front();
+        }
+        self.released.push_back((entry.fingerprint, handle));
+        true
+    }
+}
+
+/// Credentials handles keyed by the raw value written into [`SecHandle::dw_lower`].
+///
+/// A released handle can be reused for the same credentials during reconnection, but simultaneous
+/// acquisitions must not share credentials or attributes. Only the most recently released handles
+/// are retained, without storing the credentials themselves.
+static CREDENTIALS: LazyLock<Mutex<CredentialsRegistry>> = LazyLock::new(|| Mutex::new(CredentialsRegistry::default()));
+
+/// Registers `credentials` and returns their raw handle value.
+pub(crate) fn register_credentials(credentials: CredentialsHandle) -> Result<c_ulonglong> {
+    CREDENTIALS.lock()?.register(credentials)
+}
+
+/// Returns a copy of the credentials registered under `handle`.
+pub(crate) fn credentials_by_handle(handle: c_ulonglong) -> Result<Option<CredentialsHandle>> {
+    Ok(CREDENTIALS
+        .lock()?
+        .live
+        .get(&handle)
+        .map(|entry| entry.credentials.clone()))
+}
+
+/// Applies `update` to the attributes of the credentials registered under `handle`.
+///
+/// Returns `false` when nothing is registered under `handle`.
+pub(crate) fn update_credentials_attributes(
+    handle: c_ulonglong,
+    update: impl FnOnce(&mut CredentialsAttributes),
+) -> Result<bool> {
+    Ok(CREDENTIALS
+        .lock()?
+        .live
+        .get_mut(&handle)
+        .map(|entry| update(&mut entry.credentials.attributes))
+        .is_some())
+}
+
+/// Releases a credential while retaining only its fingerprint and handle for reconnection.
+///
+/// Returns `false` when nothing is registered under `handle`.
+pub(crate) fn release_credentials(handle: c_ulonglong) -> Result<bool> {
+    Ok(CREDENTIALS.lock()?.release(handle))
 }
 
 fn create_negotiate_context(attributes: &CredentialsAttributes) -> Result<Negotiate> {
@@ -273,7 +477,7 @@ pub(crate) unsafe fn p_ctxt_handle_to_sspi_context(
     }
 
     // SAFETY: `*context` is guaranteed to be non-null due to the prior check.
-    if unsafe { (*(*context)).dw_lower } == 0 {
+    if unsafe { (*(*context)).dw_upper } == 0 {
         if security_package_name.is_none() {
             return Err(Error::new(
                 ErrorKind::InvalidParameter,
@@ -333,17 +537,16 @@ pub(crate) unsafe fn p_ctxt_handle_to_sspi_context(
         // SAFETY: `*context` is convertible to a reference.
         let context = unsafe { (*context).as_mut() }.expect("context should not be null");
 
-        context.dw_lower = into_raw_ptr(sspi_context).expose_provenance().try_into()?;
+        context.dw_lower = SecurityPackageId::from_package_name(name)?.into();
+        context.dw_upper = into_raw_ptr(sspi_context).expose_provenance().try_into()?;
 
-        if context.dw_upper == 0 {
-            context.dw_upper = into_raw_ptr(name.to_owned()).expose_provenance().try_into()?;
-        }
+        debug!(?context);
     }
 
     // SAFETY: `*context` is guaranteed to be non-null due to the prior check.
-    let dw_lower = unsafe { &**context }.dw_lower;
-    let addr = usize::try_from(dw_lower)?;
-    Ok(NonNull::new(ptr::with_exposed_provenance_mut(addr)).expect("dw_lower must be initialized"))
+    let dw_upper = unsafe { &**context }.dw_upper;
+    let addr = usize::try_from(dw_upper)?;
+    Ok(NonNull::new(ptr::with_exposed_provenance_mut(addr)).expect("dw_upper must be initialized"))
 }
 
 fn verify_security_package(package_name: &str) -> Result<()> {
@@ -407,32 +610,27 @@ pub unsafe extern "system" fn AcquireCredentialsHandleA(
             unsafe { auth_data_to_identity_buffers(&security_package_name, p_auth_data, &mut package_list) }
         );
 
-        let handle = into_raw_ptr(CredentialsHandle {
+        let handle = try_execute!(register_credentials(CredentialsHandle {
             credentials,
             security_package_name,
             attributes: CredentialsAttributes::new_with_package_list(package_list),
-        }).expose_provenance();
-        let handle = try_execute!(handle.try_into(), ErrorKind::InvalidHandle);
+        }));
         // SAFETY: `ph_credentials` is guaranteed to be non-null due to the prior check.
         unsafe {
             (*ph_credential).dw_lower = handle;
         }
+        // We do not use `dw_upper` for the credentials handle, so we reset the field.
+        // SAFETY: `ph_credentials` is guaranteed to be non-null due to the prior check.
+        unsafe {
+            (*ph_credential).dw_upper = 0;
+        }
+
+        // SAFETY: `ph_credential` is guaranteed to be non-null due to the prior check.
+        unsafe { log_sec_handle("AcquireCredentialsHandleA: acquired credentials handle", ph_credential) };
 
         0
     }
 }
-
-pub type AcquireCredentialsHandleFnA = unsafe extern "system" fn(
-    LpStr,
-    LpStr,
-    u32,
-    *const c_void,
-    *const c_void,
-    SecGetKeyFn,
-    *const c_void,
-    PCredHandle,
-    PTimeStamp,
-) -> SecurityStatus;
 
 /// The `AcquireCredentialsHandleW` function acquires a handle to preexisting credentials of a security principal.
 ///
@@ -485,58 +683,63 @@ pub unsafe extern "system" fn AcquireCredentialsHandleW(
             unsafe { auth_data_to_identity_buffers(&security_package_name, p_auth_data, &mut package_list) }
         );
 
-        let handle = into_raw_ptr(CredentialsHandle {
+        let handle = try_execute!(register_credentials(CredentialsHandle {
             credentials,
             security_package_name,
             attributes: CredentialsAttributes::new_with_package_list(package_list),
-        }).expose_provenance();
-        let handle = try_execute!(handle.try_into(), ErrorKind::InvalidHandle);
+        }));
         // SAFETY: `ph_credentials` is guaranteed to be non-null due to the prior check.
         unsafe {
             (*ph_credential).dw_lower = handle;
         }
+        // We do not use `dw_upper` for the credentials handle, so we reset the field.
+        // SAFETY: `ph_credentials` is guaranteed to be non-null due to the prior check.
+        unsafe {
+            (*ph_credential).dw_upper = 0;
+        }
+
+        // SAFETY: `ph_credential` is guaranteed to be non-null due to the prior check.
+        unsafe { log_sec_handle("AcquireCredentialsHandleW: acquired credentials handle", ph_credential) };
 
         0
     }
 }
 
-pub type AcquireCredentialsHandleFnW = unsafe extern "system" fn(
-    LpcWStr,
-    LpcWStr,
-    u32,
-    *const c_void,
-    *const c_void,
-    SecGetKeyFn,
-    *const c_void,
-    PCredHandle,
-    PTimeStamp,
-) -> SecurityStatus;
-
+/// # Safety
+///
+/// `ph_credential` must be null or a valid pointer to a `SecHandle` structure.
 #[instrument(skip_all)]
 #[cfg_attr(windows, rename_symbol(to = "Rust_QueryCredentialsAttributesA"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn QueryCredentialsAttributesA(
-    _ph_credential: PCredHandle,
-    _ul_attribute: u32,
+pub unsafe extern "system" fn QueryCredentialsAttributesA(
+    ph_credential: PCredHandle,
+    ul_attribute: u32,
     _p_buffer: *mut c_void,
 ) -> SecurityStatus {
+    // SAFETY: `ph_credential` is either null or a valid pointer to a `SecHandle`, per the safety preconditions.
+    unsafe { log_sec_handle("QueryCredentialsAttributesA", ph_credential) };
+    debug!(ul_attribute);
+
     ErrorKind::UnsupportedFunction.to_u32().unwrap()
 }
 
-pub type QueryCredentialsAttributesFnA = extern "system" fn(PCredHandle, u32, *mut c_void) -> SecurityStatus;
-
+/// # Safety
+///
+/// `ph_credential` must be null or a valid pointer to a `SecHandle` structure.
 #[instrument(skip_all)]
 #[cfg_attr(windows, rename_symbol(to = "Rust_QueryCredentialsAttributesW"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn QueryCredentialsAttributesW(
-    _ph_credential: PCredHandle,
-    _ul_attribute: u32,
+pub unsafe extern "system" fn QueryCredentialsAttributesW(
+    ph_credential: PCredHandle,
+    ul_attribute: u32,
     _p_buffer: *mut c_void,
 ) -> SecurityStatus {
+    // SAFETY: `ph_credential` is either null or a valid pointer to a `SecHandle`, per the safety preconditions.
+    unsafe { log_sec_handle("QueryCredentialsAttributesW", ph_credential) };
+    debug!(ul_attribute);
+
     ErrorKind::UnsupportedFunction.to_u32().unwrap()
 }
-
-pub type QueryCredentialsAttributesFnW = extern "system" fn(PCredHandle, u32, *mut c_void) -> SecurityStatus;
 
 /// The `InitializeSecurityContextA` function initiates the client side, outbound `security context` from
 /// a credential handle. The function is used to build a security context between the client application
@@ -601,15 +804,12 @@ pub unsafe extern "system" fn InitializeSecurityContextA(
 
         // SAFETY: `ph_credentials` is guaranteed to be non-null due to the prior check.
         let dw_lower = unsafe { (*ph_credential).dw_lower };
-        let addr = try_execute!(usize::try_from(dw_lower), ErrorKind::InvalidHandle);
-        let credentials_handle: *mut CredentialsHandle = ptr::with_exposed_provenance_mut(addr);
 
-        // SAFETY: `credentials_handle` is either null or a valid pointer to the `CredentialsHandle` allocated by an SSPI function.
-        let transformted_credentials_handle = unsafe { transform_credentials_handle(credentials_handle) };
-        let (auth_data, security_package_name, attributes) = match transformted_credentials_handle {
-            Some(creds_handle) => creds_handle,
-            None => return ErrorKind::InvalidHandle.to_u32().unwrap(),
-        };
+        let CredentialsHandle { credentials: auth_data, security_package_name, attributes } =
+            match try_execute!(credentials_by_handle(dw_lower)) {
+                Some(creds_handle) => creds_handle,
+                None => return ErrorKind::InvalidHandle.to_u32().unwrap(),
+            };
 
         let mut sspi_context_ptr = try_execute!(
             // SAFETY:
@@ -617,8 +817,8 @@ pub unsafe extern "system" fn InitializeSecurityContextA(
             // - The values behind `ph_context.dw_lower` and `ph_context.dw_upper` pointers are allocated by an SSPI function.
             unsafe { p_ctxt_handle_to_sspi_context(
                 &mut ph_context,
-                Some(security_package_name),
-                attributes
+                Some(security_package_name.as_str()),
+                &attributes
             )}
         );
 
@@ -668,12 +868,12 @@ pub unsafe extern "system" fn InitializeSecurityContextA(
         // SAFETY: `ph_new_context` is convertible to a reference.
         let new_context = unsafe { ph_new_context.as_mut() }.expect("ph_new_context is non-null");
 
-        let dw_lower = sspi_context_ptr.as_ptr().expose_provenance();
-        new_context.dw_lower = try_execute!(dw_lower.try_into(), ErrorKind::InvalidHandle);
+        let dw_upper = sspi_context_ptr.as_ptr().expose_provenance();
+        new_context.dw_upper = try_execute!(dw_upper.try_into(), ErrorKind::InvalidHandle);
         // SAFETY:
         // `ph_context` is guaranteed to be non-null since it is initialized in the `p_ctxt_handle_to_sspi_context`
         // if it was previously null.
-        new_context.dw_upper = unsafe { (*ph_context).dw_upper };
+        new_context.dw_lower = unsafe { (*ph_context).dw_lower };
 
         // SAFETY: `pf_context_attr` is guaranteed to be non-null due to the prior check.
         unsafe { *pf_context_attr = f_context_req; }
@@ -682,21 +882,6 @@ pub unsafe extern "system" fn InitializeSecurityContextA(
         result.status.to_u32().unwrap()
     }
 }
-
-pub type InitializeSecurityContextFnA = unsafe extern "system" fn(
-    PCredHandle,
-    PCtxtHandle,
-    *const SecChar,
-    u32,
-    u32,
-    u32,
-    PSecBufferDesc,
-    u32,
-    PCtxtHandle,
-    PSecBufferDesc,
-    *mut u32,
-    PTimeStamp,
-) -> SecurityStatus;
 
 /// The `InitializeSecurityContextW` function initiates the client side, outbound `security context` from
 /// a credential handle. The function is used to build a security context between the client application
@@ -765,15 +950,12 @@ pub unsafe extern "system" fn InitializeSecurityContextW(
 
         // SAFETY: `ph_credentials` is guaranteed to be non-null due to the prior check.
         let dw_lower = unsafe { (*ph_credential).dw_lower };
-        let addr = try_execute!(usize::try_from(dw_lower), ErrorKind::InvalidHandle);
-        let credentials_handle: *mut CredentialsHandle = ptr::with_exposed_provenance_mut(addr);
 
-        // SAFETY: `credentials_handle` is either null or a valid pointer to the `CredentialsHandle` allocated by an SSPI function.
-        let transformted_credentials_handle = unsafe { transform_credentials_handle(credentials_handle) };
-        let (auth_data, security_package_name, attributes) = match transformted_credentials_handle {
-            Some(creds_handle) => creds_handle,
-            None => return ErrorKind::InvalidHandle.to_u32().unwrap(),
-        };
+        let CredentialsHandle { credentials: auth_data, security_package_name, attributes } =
+            match try_execute!(credentials_by_handle(dw_lower)) {
+                Some(creds_handle) => creds_handle,
+                None => return ErrorKind::InvalidHandle.to_u32().unwrap(),
+            };
 
         let mut sspi_context_ptr = try_execute!(
             // SAFETY:
@@ -781,8 +963,8 @@ pub unsafe extern "system" fn InitializeSecurityContextW(
             // - The values behind `ph_context.dw_lower` and `ph_context.dw_upper` pointers are allocated by an SSPI function.
             unsafe { p_ctxt_handle_to_sspi_context(
                 &mut ph_context,
-                Some(security_package_name),
-                attributes,
+                Some(security_package_name.as_str()),
+                &attributes,
             )}
         );
 
@@ -834,12 +1016,12 @@ pub unsafe extern "system" fn InitializeSecurityContextW(
         // SAFETY: `ph_new_context` is convertible to a reference.
         let new_context = unsafe { ph_new_context.as_mut() }.expect("ph_new_context is non-null");
 
-        let dw_lower = sspi_context_ptr.as_ptr().expose_provenance();
-        new_context.dw_lower = try_execute!(dw_lower.try_into(), ErrorKind::InvalidHandle);
+        let dw_upper = sspi_context_ptr.as_ptr().expose_provenance();
+        new_context.dw_upper = try_execute!(dw_upper.try_into(), ErrorKind::InvalidHandle);
         // SAFETY:
         // `ph_context` is guaranteed to be non-null since it is initialized in the `p_ctxt_handle_to_sspi_context`
         // if it was previously null.
-        new_context.dw_upper = unsafe { (*ph_context).dw_upper };
+        new_context.dw_lower = unsafe { (*ph_context).dw_lower };
 
         // SAFETY: `pf_context_attr` is guaranteed to be non-null due to the prior check.
         unsafe { *pf_context_attr = f_context_req; }
@@ -848,21 +1030,6 @@ pub unsafe extern "system" fn InitializeSecurityContextW(
         result.status.to_u32().unwrap()
     }
 }
-
-pub type InitializeSecurityContextFnW = unsafe extern "system" fn(
-    PCredHandle,
-    PCtxtHandle,
-    *const SecWChar,
-    u32,
-    u32,
-    u32,
-    PSecBufferDesc,
-    u32,
-    PCtxtHandle,
-    PSecBufferDesc,
-    *mut u32,
-    PTimeStamp,
-) -> SecurityStatus;
 
 /// # Safety
 ///
@@ -1210,8 +1377,6 @@ pub unsafe extern "system" fn QueryContextAttributesA(
     unsafe { query_context_attributes_common(ph_context, ul_attribute, p_buffer, false) }
 }
 
-pub type QueryContextAttributesFnA = unsafe extern "system" fn(PCtxtHandle, u32, *mut c_void) -> SecurityStatus;
-
 /// The `QueryContextAttributesW` function lets a transport application query the Credential Security
 /// Support Provider (CredSSP) `security package` for certain attributes of a `security context`.
 ///
@@ -1239,8 +1404,6 @@ pub unsafe extern "system" fn QueryContextAttributesW(
     unsafe { query_context_attributes_common(ph_context, ul_attribute, p_buffer, true) }
 }
 
-pub type QueryContextAttributesFnW = unsafe extern "system" fn(PCtxtHandle, u32, *mut c_void) -> SecurityStatus;
-
 #[instrument(skip_all)]
 #[cfg_attr(windows, rename_symbol(to = "Rust_ImportSecurityContextA"))]
 #[unsafe(no_mangle)]
@@ -1253,9 +1416,6 @@ pub extern "system" fn ImportSecurityContextA(
     ErrorKind::UnsupportedFunction.to_u32().unwrap()
 }
 
-pub type ImportSecurityContextFnA =
-    extern "system" fn(PSecurityString, PSecBuffer, *mut c_void, PCtxtHandle) -> SecurityStatus;
-
 #[instrument(skip_all)]
 #[cfg_attr(windows, rename_symbol(to = "Rust_ImportSecurityContextW"))]
 #[unsafe(no_mangle)]
@@ -1267,9 +1427,6 @@ pub extern "system" fn ImportSecurityContextW(
 ) -> SecurityStatus {
     ErrorKind::UnsupportedFunction.to_u32().unwrap()
 }
-
-pub type ImportSecurityContextFnW =
-    extern "system" fn(PSecurityString, PSecBuffer, *mut c_void, PCtxtHandle) -> SecurityStatus;
 
 #[instrument(skip_all)]
 #[cfg_attr(windows, rename_symbol(to = "Rust_AddCredentialsA"))]
@@ -1287,17 +1444,6 @@ pub extern "system" fn AddCredentialsA(
     ErrorKind::UnsupportedFunction.to_u32().unwrap()
 }
 
-pub type AddCredentialsFnA = extern "system" fn(
-    PCredHandle,
-    *mut SecChar,
-    *mut SecChar,
-    u32,
-    *mut c_void,
-    SecGetKeyFn,
-    *mut c_void,
-    PTimeStamp,
-) -> SecurityStatus;
-
 #[instrument(skip_all)]
 #[cfg_attr(windows, rename_symbol(to = "Rust_AddCredentialsW"))]
 #[unsafe(no_mangle)]
@@ -1314,17 +1460,6 @@ pub extern "system" fn AddCredentialsW(
     ErrorKind::UnsupportedFunction.to_u32().unwrap()
 }
 
-pub type AddCredentialsFnW = extern "system" fn(
-    PCredHandle,
-    *mut SecWChar,
-    *mut SecWChar,
-    u32,
-    *mut c_void,
-    SecGetKeyFn,
-    *mut c_void,
-    PTimeStamp,
-) -> SecurityStatus;
-
 #[instrument(skip_all)]
 #[cfg_attr(windows, rename_symbol(to = "Rust_SetContextAttributesA"))]
 #[unsafe(no_mangle)]
@@ -1337,8 +1472,6 @@ pub extern "system" fn SetContextAttributesA(
     ErrorKind::UnsupportedFunction.to_u32().unwrap()
 }
 
-pub type SetContextAttributesFnA = extern "system" fn(PCtxtHandle, u32, *mut c_void, u32) -> SecurityStatus;
-
 #[cfg_attr(windows, rename_symbol(to = "Rust_SetContextAttributesW"))]
 #[unsafe(no_mangle)]
 pub extern "system" fn SetContextAttributesW(
@@ -1349,8 +1482,6 @@ pub extern "system" fn SetContextAttributesW(
 ) -> SecurityStatus {
     ErrorKind::UnsupportedFunction.to_u32().unwrap()
 }
-
-pub type SetContextAttributesFnW = extern "system" fn(PCtxtHandle, u32, *mut c_void, u32) -> SecurityStatus;
 
 /// Sets the `attributes` of a `credential`, such as the name associated with the credential. The information
 /// is valid for any `security context` created with the specified credential.
@@ -1377,23 +1508,16 @@ pub unsafe extern "system" fn SetCredentialsAttributesA(
         check_null!(ph_credential);
         check_null!(p_buffer);
 
+        // SAFETY: `ph_credential` is guaranteed to be non-null due to the prior check.
+        unsafe { log_sec_handle("SetCredentialsAttributesA", ph_credential) };
+        debug!(ul_attribute);
+
         // SAFETY:
         // - `ph_credentials` is guaranteed to be non-null due to the prior check.
         // - `ph_credentials` points to a valid `credentials handle` allocated by an SSPI function.
         let dw_lower = unsafe { (*ph_credential).dw_lower };
-        let addr = try_execute!(usize::try_from(dw_lower), ErrorKind::InvalidHandle);
-        let credentials_handle_ptr: *mut CredentialsHandle = ptr::with_exposed_provenance_mut(addr);
 
-        // SAFETY:
-        // - `credentials_handle` a valid pointer to the `CredentialsHandle` allocated by an SSPI function.
-        // - `credentials_handle` is convertible to a reference.
-        let credentials_handle = if let Some(credentials_handle) = unsafe { credentials_handle_ptr.as_mut() } {
-            credentials_handle
-        } else {
-            return ErrorKind::InvalidParameter.to_u32().unwrap();
-        };
-
-        if ul_attribute == SECPKG_CRED_ATTR_NAMES {
+        let updated = if ul_attribute == SECPKG_CRED_ATTR_NAMES {
             let workstation =
                 try_execute!(
                     // SAFETY:
@@ -1404,19 +1528,20 @@ pub unsafe extern "system" fn SetCredentialsAttributesA(
                     ErrorKind::InvalidParameter
                 ).to_owned();
 
-            credentials_handle.attributes.workstation = Some(workstation);
-
-            0
+            try_execute!(update_credentials_attributes(dw_lower, |attributes| {
+                attributes.workstation = Some(workstation);
+            }))
         } else if ul_attribute == SECPKG_CRED_ATTR_KDC_PROXY_SETTINGS {
-            credentials_handle.attributes.kdc_proxy_settings =
-                Some(try_execute!(
-                    // SAFETY:
-                    // - `p_buffer` is not-null.
-                    // - `p_buffer` points to a valid `SecPkgCredentialsKdcProxySettingsW` structure.
-                    unsafe { extract_kdc_proxy_settings(NonNull::new(p_buffer).expect("p_buffer should not be null")) }
-                ));
+            let kdc_proxy_settings = try_execute!(
+                // SAFETY:
+                // - `p_buffer` is not-null.
+                // - `p_buffer` points to a valid `SecPkgCredentialsKdcProxySettingsW` structure.
+                unsafe { extract_kdc_proxy_settings(NonNull::new(p_buffer).expect("p_buffer should not be null")) }
+            );
 
-            0
+            try_execute!(update_credentials_attributes(dw_lower, |attributes| {
+                attributes.kdc_proxy_settings = Some(kdc_proxy_settings);
+            }))
         } else if ul_attribute == SECPKG_CRED_ATTR_KDC_URL {
             let cred_attr = p_buffer.cast::<SecPkgCredentialsKdcUrlA>();
 
@@ -1437,16 +1562,22 @@ pub unsafe extern "system" fn SetCredentialsAttributesA(
                 // - The memory region `kdc_url` points to is valid for reads of bytes up to and including null-terminator.
                 unsafe { CStr::from_ptr(kdc_url) }.to_str(),
                 ErrorKind::InvalidParameter
-            );
-            credentials_handle.attributes.kdc_url = Some(kdc_url.to_string());
+            ).to_owned();
+
+            try_execute!(update_credentials_attributes(dw_lower, |attributes| {
+                attributes.kdc_url = Some(kdc_url);
+            }))
+        } else {
+            return ErrorKind::UnsupportedFunction.to_u32().unwrap();
+        };
+
+        if updated {
             0
         } else {
-            ErrorKind::UnsupportedFunction.to_u32().unwrap()
+            ErrorKind::InvalidParameter.to_u32().unwrap()
         }
     }
 }
-
-pub type SetCredentialsAttributesFnA = unsafe extern "system" fn(PCtxtHandle, u32, *mut c_void, u32) -> SecurityStatus;
 
 /// Sets the `attributes` of a `credential`, such as the name associated with the credential. The information
 /// is valid for any `security context` created with the specified credential.
@@ -1473,23 +1604,16 @@ pub unsafe extern "system" fn SetCredentialsAttributesW(
         check_null!(ph_credential);
         check_null!(p_buffer);
 
+        // SAFETY: `ph_credential` is guaranteed to be non-null due to the prior check.
+        unsafe { log_sec_handle("SetCredentialsAttributesW", ph_credential) };
+        debug!(ul_attribute);
+
         // SAFETY:
         // - `ph_credentials` is guaranteed to be non-null due to the prior check.
         // - `ph_credentials` points to a valid `credentials handle` allocated by an SSPI function.
         let dw_lower = unsafe { (*ph_credential).dw_lower };
-        let addr = try_execute!(usize::try_from(dw_lower), ErrorKind::InvalidHandle);
-        let credentials_handle_ptr: *mut CredentialsHandle = ptr::with_exposed_provenance_mut(addr);
 
-        // SAFETY:
-        // - `credentials_handle` a valid pointer to the `CredentialsHandle` allocated by an SSPI function.
-        // - `credentials_handle` is convertible to a reference.
-        let credentials_handle = if let Some(credentials_handle) = unsafe { credentials_handle_ptr.as_mut() } {
-            credentials_handle
-        } else {
-            return ErrorKind::InvalidParameter.to_u32().unwrap();
-        };
-
-        if ul_attribute == SECPKG_CRED_ATTR_NAMES {
+        let updated = if ul_attribute == SECPKG_CRED_ATTR_NAMES {
             let workstation = try_execute!(
                 // SAFETY:
                 // - `p_buffer` is guaranteed to be non-null due to the prior check.
@@ -1499,19 +1623,20 @@ pub unsafe extern "system" fn SetCredentialsAttributesW(
                 unsafe { U16CString::from_ptr_str(p_buffer.cast()) }.to_string().map_err(Error::from)
             );
 
-            credentials_handle.attributes.workstation = Some(workstation);
-
-            0
+            try_execute!(update_credentials_attributes(dw_lower, |attributes| {
+                attributes.workstation = Some(workstation);
+            }))
         } else if ul_attribute == SECPKG_CRED_ATTR_KDC_PROXY_SETTINGS {
-            credentials_handle.attributes.kdc_proxy_settings =
-                Some(try_execute!(
-                    // SAFETY:
-                    // - `p_buffer` is not-null.
-                    // - `p_buffer` points to a valid `SecPkgCredentialsKdcProxySettingsW` structure.
-                    unsafe { extract_kdc_proxy_settings(NonNull::new(p_buffer).expect("p_buffer should not be null")) }
-                ));
+            let kdc_proxy_settings = try_execute!(
+                // SAFETY:
+                // - `p_buffer` is not-null.
+                // - `p_buffer` points to a valid `SecPkgCredentialsKdcProxySettingsW` structure.
+                unsafe { extract_kdc_proxy_settings(NonNull::new(p_buffer).expect("p_buffer should not be null")) }
+            );
 
-            0
+            try_execute!(update_credentials_attributes(dw_lower, |attributes| {
+                attributes.kdc_proxy_settings = Some(kdc_proxy_settings);
+            }))
         } else if ul_attribute == SECPKG_CRED_ATTR_KDC_URL {
             let cred_attr = p_buffer.cast::<SecPkgCredentialsKdcUrlW>();
             // SAFETY:
@@ -1532,16 +1657,21 @@ pub unsafe extern "system" fn SetCredentialsAttributesW(
                 // - `kdc_url` is properly aligned for `u16`, per the safety preconditions.
                 unsafe { U16CString::from_ptr_str(kdc_url) }.to_string().map_err(Error::from)
             );
-            credentials_handle.attributes.kdc_url = Some(kdc_url);
 
+            try_execute!(update_credentials_attributes(dw_lower, |attributes| {
+                attributes.kdc_url = Some(kdc_url);
+            }))
+        } else {
+            return ErrorKind::UnsupportedFunction.to_u32().unwrap();
+        };
+
+        if updated {
             0
         } else {
-            ErrorKind::UnsupportedFunction.to_u32().unwrap()
+            ErrorKind::InvalidParameter.to_u32().unwrap()
         }
     }
 }
-
-pub type SetCredentialsAttributesFnW = unsafe extern "system" fn(PCtxtHandle, u32, *mut c_void, u32) -> SecurityStatus;
 
 /// The `ChangeAccountPasswordA` function changes the password for a Windows domain account by using
 /// the specified `Security Support Provider`.
@@ -1674,17 +1804,6 @@ pub unsafe extern "system" fn ChangeAccountPasswordA(
     }
 }
 
-pub type ChangeAccountPasswordFnA = unsafe extern "system" fn(
-    *mut SecChar,
-    *mut SecChar,
-    *mut SecChar,
-    *mut SecChar,
-    *mut SecChar,
-    bool,
-    u32,
-    PSecBufferDesc,
-) -> SecurityStatus;
-
 /// The `ChangeAccountPasswordW` function changes the password for a Windows domain account by using
 /// the specified `Security Support Provider`.
 ///
@@ -1789,17 +1908,6 @@ pub unsafe extern "system" fn ChangeAccountPasswordW(
     }
 }
 
-pub type ChangeAccountPasswordFnW = unsafe extern "system" fn(
-    *mut SecWChar,
-    *mut SecWChar,
-    *mut SecWChar,
-    *mut SecWChar,
-    *mut SecWChar,
-    bool,
-    u32,
-    PSecBufferDesc,
-) -> SecurityStatus;
-
 #[instrument(skip_all)]
 #[cfg_attr(windows, rename_symbol(to = "Rust_QueryContextAttributesExA"))]
 #[unsafe(no_mangle)]
@@ -1811,8 +1919,6 @@ pub extern "system" fn QueryContextAttributesExA(
 ) -> SecurityStatus {
     ErrorKind::UnsupportedFunction.to_u32().unwrap()
 }
-
-pub type QueryContextAttributesExFnA = extern "system" fn(PCtxtHandle, u32, *mut c_void, u32) -> SecurityStatus;
 
 #[instrument(skip_all)]
 #[cfg_attr(windows, rename_symbol(to = "Rust_QueryContextAttributesExW"))]
@@ -1826,35 +1932,43 @@ pub extern "system" fn QueryContextAttributesExW(
     ErrorKind::UnsupportedFunction.to_u32().unwrap()
 }
 
-pub type QueryContextAttributesExFnW = extern "system" fn(PCtxtHandle, u32, *mut c_void, u32) -> SecurityStatus;
-
+/// # Safety
+///
+/// `ph_credential` must be null or a valid pointer to a `SecHandle` structure.
 #[instrument(skip_all)]
 #[cfg_attr(windows, rename_symbol(to = "Rust_QueryCredentialsAttributesExA"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn QueryCredentialsAttributesExA(
-    _ph_credential: PCredHandle,
-    _ul_attribute: u32,
+pub unsafe extern "system" fn QueryCredentialsAttributesExA(
+    ph_credential: PCredHandle,
+    ul_attribute: u32,
     _p_buffer: *mut c_void,
     _c_buffers: u32,
 ) -> SecurityStatus {
+    // SAFETY: `ph_credential` is either null or a valid pointer to a `SecHandle`, per the safety preconditions.
+    unsafe { log_sec_handle("QueryCredentialsAttributesExA", ph_credential) };
+    debug!(ul_attribute);
+
     ErrorKind::UnsupportedFunction.to_u32().unwrap()
 }
 
-pub type QueryCredentialsAttributesExFnA = extern "system" fn(PCredHandle, u32, *mut c_void, u32) -> SecurityStatus;
-
+/// # Safety
+///
+/// `ph_credential` must be null or a valid pointer to a `SecHandle` structure.
 #[instrument(skip_all)]
 #[cfg_attr(windows, rename_symbol(to = "Rust_QueryCredentialsAttributesExW"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn QueryCredentialsAttributesExW(
-    _ph_aredential: PCredHandle,
-    _ul_attribute: u32,
+pub unsafe extern "system" fn QueryCredentialsAttributesExW(
+    ph_credential: PCredHandle,
+    ul_attribute: u32,
     _p_buffer: *mut c_void,
     _c_buffers: u32,
 ) -> SecurityStatus {
+    // SAFETY: `ph_credential` is either null or a valid pointer to a `SecHandle`, per the safety preconditions.
+    unsafe { log_sec_handle("QueryCredentialsAttributesExW", ph_credential) };
+    debug!(ul_attribute);
+
     ErrorKind::UnsupportedFunction.to_u32().unwrap()
 }
-
-pub type QueryCredentialsAttributesExFnW = extern "system" fn(PCredHandle, u32, *mut c_void, u32) -> SecurityStatus;
 
 #[cfg(test)]
 #[expect(
@@ -1868,13 +1982,15 @@ mod tests {
     use libc::c_void;
     use num_traits::ToPrimitive;
     use sspi::SecurityStatus::ContinueNeeded;
-    use sspi::{ErrorKind, U16CString, Utf16String, Utf16StringExt};
+    use sspi::{AuthIdentityBuffers, CredentialsBuffers, ErrorKind, U16CString, Utf16String, Utf16StringExt};
 
     use crate::sspi::common::{DeleteSecurityContext, FreeContextBuffer, FreeCredentialsHandle};
+    use crate::sspi::credentials_attributes::CredentialsAttributes;
     use crate::sspi::sec_buffer::{SecBuffer, SecBufferDesc};
     use crate::sspi::sec_handle::{
-        AcquireCredentialsHandleA, AcquireCredentialsHandleW, InitializeSecurityContextA, InitializeSecurityContextW,
-        SecHandle,
+        AcquireCredentialsHandleA, AcquireCredentialsHandleW, CredentialsHandle, CredentialsRegistry,
+        InitializeSecurityContextA, InitializeSecurityContextW, MAX_RELEASED_CREDENTIALS, SecHandle, SecurityPackageId,
+        SetCredentialsAttributesW, credentials_by_handle,
     };
     use crate::sspi::sec_pkg_info::{
         EnumerateSecurityPackagesA, EnumerateSecurityPackagesW, PSecPkgInfoA, PSecPkgInfoW, QuerySecurityPackageInfoA,
@@ -1887,7 +2003,7 @@ mod tests {
 
     extern "system" fn dummy(_: *mut c_void, _: *mut c_void, _: u32, _: *mut *mut c_void, _: *mut i32) {}
 
-    fn initialize_negotiate_security_context_with_package_list(pkg_list: &str) -> u32 {
+    fn initialize_negotiate_security_context_with_package_list(user: &str, pkg_list: &str) -> u32 {
         let mut pkg_name = "Negotiate\0".encode_utf16().collect::<Vec<_>>();
         let mut pkg_info: PSecPkgInfoW = null_mut::<SecPkgInfoW>();
 
@@ -1906,7 +2022,7 @@ mod tests {
         let status = unsafe { FreeContextBuffer(pkg_info.cast()) };
         assert_eq!(status, 0);
 
-        let user = "user".encode_utf16().collect::<Vec<_>>();
+        let user = user.encode_utf16().collect::<Vec<_>>();
         let domain = "domain".encode_utf16().collect::<Vec<_>>();
         let password = "password".encode_utf16().collect::<Vec<_>>();
 
@@ -2007,13 +2123,13 @@ mod tests {
 
     #[test]
     fn initialize_negotiate_security_context_fail() {
-        let status = initialize_negotiate_security_context_with_package_list("N");
+        let status = initialize_negotiate_security_context_with_package_list("user_fail", "N");
         assert_eq!(status, ErrorKind::NoCredentials.to_u32().unwrap());
     }
 
     #[test]
     fn initialize_negotiate_security_context_success() {
-        let status = initialize_negotiate_security_context_with_package_list("NTLM,N");
+        let status = initialize_negotiate_security_context_with_package_list("user_success", "NTLM,N");
         assert_eq!(status, ContinueNeeded.to_u32().unwrap());
     }
 
@@ -2545,10 +2661,10 @@ mod tests {
     fn query_context_session_key() {
         use std::slice::from_raw_parts;
 
+        use ffi_types::sspi::SecPkgContextSessionKey;
         use sspi::credssp::SspiContext;
 
         use crate::sspi::sec_handle::{QueryContextAttributesW, SECPKG_ATTR_SESSION_KEY, SspiHandle};
-        use crate::sspi::sspi_data_types::SecPkgContextSessionKey;
         use crate::utils::into_raw_ptr;
 
         let kerberos_client = sspi::kerberos::test_data::fake_client();
@@ -2558,11 +2674,8 @@ mod tests {
         let sspi_context = SspiHandle::new(SspiContext::Kerberos(kerberos_client));
         let sspi_context_ptr = into_raw_ptr(sspi_context).expose_provenance();
         let mut sec_handle = SecHandle {
-            dw_lower: sspi_context_ptr.try_into().unwrap(),
-            dw_upper: into_raw_ptr(sspi::kerberos::PACKAGE_INFO.name.to_string())
-                .expose_provenance()
-                .try_into()
-                .unwrap(),
+            dw_lower: SecurityPackageId::Kerberos.into(),
+            dw_upper: sspi_context_ptr.try_into().unwrap(),
         };
 
         let mut session_key = SecPkgContextSessionKey {
@@ -2596,21 +2709,18 @@ mod tests {
         let status = unsafe { FreeContextBuffer(session_key.session_key.cast()) };
         assert_eq!(status, 0);
 
-        let dw_upper_ptr: *mut String = ptr::with_exposed_provenance_mut(sec_handle.dw_upper.try_into().unwrap());
-        let _ = unsafe { Box::from_raw(dw_upper_ptr) };
-
-        let dw_lower_ptr: *mut SspiHandle = ptr::with_exposed_provenance_mut(sec_handle.dw_lower.try_into().unwrap());
-        let _ = unsafe { Box::from_raw(dw_lower_ptr) };
+        let context_ptr: *mut SspiHandle = ptr::with_exposed_provenance_mut(sec_handle.dw_upper.try_into().unwrap());
+        let _ = unsafe { Box::from_raw(context_ptr) };
     }
 
     #[test]
     fn query_context_names() {
+        use ffi_types::sspi::{SecPkgContextNamesA, SecPkgContextNamesW};
         use sspi::credssp::SspiContext;
 
         use crate::sspi::sec_handle::{
-            QueryContextAttributesA, QueryContextAttributesW, SECPKG_ATTR_NAMES, SspiHandle,
+            QueryContextAttributesA, QueryContextAttributesW, SECPKG_ATTR_NAMES, SecurityPackageId, SspiHandle,
         };
-        use crate::sspi::sspi_data_types::{SecPkgContextNamesA, SecPkgContextNamesW};
         use crate::utils::into_raw_ptr;
 
         let kerberos_client = sspi::kerberos::test_data::fake_client();
@@ -2620,11 +2730,8 @@ mod tests {
         let sspi_context = SspiHandle::new(SspiContext::Kerberos(kerberos_client));
         let sspi_context_ptr = into_raw_ptr(sspi_context).expose_provenance();
         let mut sec_handle = SecHandle {
-            dw_lower: sspi_context_ptr.try_into().unwrap(),
-            dw_upper: into_raw_ptr(sspi::kerberos::PACKAGE_INFO.name.to_string())
-                .expose_provenance()
-                .try_into()
-                .unwrap(),
+            dw_lower: SecurityPackageId::Kerberos.into(),
+            dw_upper: sspi_context_ptr.try_into().unwrap(),
         };
 
         let mut names_w = SecPkgContextNamesW { user_name: null_mut() };
@@ -2657,10 +2764,398 @@ mod tests {
         let status = unsafe { FreeContextBuffer(names_a.user_name.cast()) };
         assert_eq!(status, 0);
 
-        let dw_upper_ptr: *mut String = ptr::with_exposed_provenance_mut(sec_handle.dw_upper.try_into().unwrap());
-        let _ = unsafe { Box::from_raw(dw_upper_ptr) };
+        let context_ptr: *mut SspiHandle = ptr::with_exposed_provenance_mut(sec_handle.dw_upper.try_into().unwrap());
+        let _ = unsafe { Box::from_raw(context_ptr) };
+    }
 
-        let dw_lower_ptr: *mut SspiHandle = ptr::with_exposed_provenance_mut(sec_handle.dw_lower.try_into().unwrap());
-        let _ = unsafe { Box::from_raw(dw_lower_ptr) };
+    fn acquire_ntlm_credentials_handle(user: &str, domain: &str) -> SecHandle {
+        acquire_ntlm_credentials_handle_with_password(user, domain, "password")
+    }
+
+    fn acquire_ntlm_credentials_handle_with_password(user: &str, domain: &str, password: &str) -> SecHandle {
+        let pkg_name = "NTLM\0".encode_utf16().collect::<Vec<_>>();
+
+        let user = user.encode_utf16().collect::<Vec<_>>();
+        let domain = domain.encode_utf16().collect::<Vec<_>>();
+        let password = password.encode_utf16().collect::<Vec<_>>();
+
+        let credentials = SecWinntAuthIdentityW {
+            user: user.as_ptr(),
+            user_length: user.len().try_into().expect("user length is a valid u32"),
+            domain: domain.as_ptr(),
+            domain_length: domain.len().try_into().expect("domain length is a valid u32"),
+            password: password.as_ptr(),
+            password_length: password.len().try_into().expect("password length is a valid u32"),
+            flags: SEC_WINNT_AUTH_IDENTITY_UNICODE,
+        };
+
+        let mut cred_handle = SecHandle {
+            dw_lower: 0,
+            dw_upper: 0,
+        };
+
+        let status = unsafe {
+            AcquireCredentialsHandleW(
+                null_mut(),
+                pkg_name.as_ptr(),
+                2, /* SECPKG_CRED_OUTBOUND */
+                null::<c_void>(),
+                ptr::from_ref(&credentials).cast(),
+                dummy,
+                null::<c_void>(),
+                &mut cred_handle,
+                null_mut(),
+            )
+        };
+        assert_eq!(status, 0);
+
+        cred_handle
+    }
+
+    fn free_credentials_handle(cred_handle: &mut SecHandle) {
+        let status = unsafe { FreeCredentialsHandle(cred_handle) };
+        assert_eq!(status, 0);
+    }
+
+    fn initialize_ntlm_security_context(cred_handle: &mut SecHandle) -> u32 {
+        const OUTPUT_LEN: usize = 4096;
+        let target = "TERMSRV/example.com\0".encode_utf16().collect::<Vec<_>>();
+        let mut output = vec![0; OUTPUT_LEN];
+        let mut buffer = SecBuffer {
+            cb_buffer: OUTPUT_LEN.try_into().unwrap(),
+            buffer_type: 2,
+            pv_buffer: output.as_mut_ptr().cast(),
+        };
+        let mut buffer_desc = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 1,
+            p_buffers: &mut buffer,
+        };
+        let mut context = SecHandle {
+            dw_lower: 0,
+            dw_upper: 0,
+        };
+        let mut new_context = SecHandle {
+            dw_lower: 0,
+            dw_upper: 0,
+        };
+        let mut attrs = 0;
+        let status = unsafe {
+            InitializeSecurityContextW(
+                cred_handle,
+                &mut context,
+                target.as_ptr(),
+                0,
+                0,
+                0x10,
+                null_mut(),
+                0,
+                &mut new_context,
+                &mut buffer_desc,
+                &mut attrs,
+                null_mut(),
+            )
+        };
+        if status == ContinueNeeded.to_u32().unwrap() {
+            assert_eq!(unsafe { DeleteSecurityContext(&mut new_context) }, 0);
+        }
+        status
+    }
+
+    fn registry_credentials(user: &str) -> CredentialsHandle {
+        CredentialsHandle {
+            credentials: CredentialsBuffers::AuthIdentity(AuthIdentityBuffers::new(
+                Utf16String::from_str(user),
+                Utf16String::from_str("domain"),
+                Utf16String::from_str("password"),
+            )),
+            security_package_name: "NTLM".to_owned(),
+            attributes: CredentialsAttributes::default(),
+        }
+    }
+
+    #[test]
+    fn acquire_credentials_handle_is_distinct_while_live() {
+        let mut first = acquire_ntlm_credentials_handle("stable_user", "stable_domain");
+        let mut second = acquire_ntlm_credentials_handle("stable_user", "stable_domain");
+        let mut third = acquire_ntlm_credentials_handle("stable_user", "stable_domain");
+
+        assert_ne!(first.dw_lower, second.dw_lower);
+        assert_ne!(second.dw_lower, third.dw_lower);
+        assert_ne!(first.dw_lower, third.dw_lower);
+
+        let second_handle = second.dw_lower;
+        free_credentials_handle(&mut first);
+        assert!(credentials_by_handle(second_handle).unwrap().is_some());
+        assert_eq!(
+            unsafe { FreeCredentialsHandle(&mut first) },
+            ErrorKind::InvalidHandle.to_u32().unwrap()
+        );
+
+        free_credentials_handle(&mut second);
+        free_credentials_handle(&mut third);
+    }
+
+    #[test]
+    fn acquiring_same_user_with_different_password_does_not_replace_credentials_or_attributes() {
+        let mut bad = acquire_ntlm_credentials_handle_with_password("same_user", "same_domain", "badpass");
+        let mut workstation = "first-workstation\0".encode_utf16().collect::<Vec<_>>();
+        assert_eq!(
+            unsafe { SetCredentialsAttributesW(&mut bad, 1, workstation.as_mut_ptr().cast(), 0) },
+            0
+        );
+
+        let mut good = acquire_ntlm_credentials_handle_with_password("same_user", "same_domain", "goodpass");
+        assert_ne!(bad.dw_lower, good.dw_lower);
+
+        let bad_credentials = credentials_by_handle(bad.dw_lower).unwrap().unwrap();
+        let good_credentials = credentials_by_handle(good.dw_lower).unwrap().unwrap();
+        assert_eq!(
+            bad_credentials
+                .credentials
+                .as_auth_identity()
+                .unwrap()
+                .password
+                .as_ref()
+                .0,
+            Utf16String::from_str("badpass")
+        );
+        assert_eq!(
+            good_credentials
+                .credentials
+                .as_auth_identity()
+                .unwrap()
+                .password
+                .as_ref()
+                .0,
+            Utf16String::from_str("goodpass")
+        );
+        assert_eq!(
+            bad_credentials.attributes.workstation.as_deref(),
+            Some("first-workstation")
+        );
+        assert_eq!(good_credentials.attributes.workstation, None);
+
+        let bad_handle = bad.dw_lower;
+        free_credentials_handle(&mut bad);
+        assert!(credentials_by_handle(bad_handle).unwrap().is_none());
+        assert!(credentials_by_handle(good.dw_lower).unwrap().is_some());
+        free_credentials_handle(&mut good);
+
+        let mut reacquired_good = acquire_ntlm_credentials_handle_with_password("same_user", "same_domain", "goodpass");
+        assert_ne!(reacquired_good.dw_lower, bad_handle);
+        assert!(credentials_by_handle(bad_handle).unwrap().is_none());
+        free_credentials_handle(&mut reacquired_good);
+    }
+
+    #[test]
+    fn initialize_security_context_rejects_freed_copy_with_a_different_password_live() {
+        let mut bad = acquire_ntlm_credentials_handle_with_password("copied_user", "domain", "badpass");
+        let mut stale = SecHandle {
+            dw_lower: bad.dw_lower,
+            dw_upper: bad.dw_upper,
+        };
+        let mut good = acquire_ntlm_credentials_handle_with_password("copied_user", "domain", "goodpass");
+        free_credentials_handle(&mut bad);
+
+        assert_eq!(
+            initialize_ntlm_security_context(&mut stale),
+            ErrorKind::InvalidHandle.to_u32().unwrap()
+        );
+        assert_eq!(
+            initialize_ntlm_security_context(&mut good),
+            ContinueNeeded.to_u32().unwrap()
+        );
+        free_credentials_handle(&mut good);
+    }
+
+    #[test]
+    fn initialize_security_context_rejects_freed_copy_while_identical_credentials_are_live() {
+        let mut first = acquire_ntlm_credentials_handle("same_secret_user", "domain");
+        let mut stale = SecHandle {
+            dw_lower: first.dw_lower,
+            dw_upper: first.dw_upper,
+        };
+        let mut second = acquire_ntlm_credentials_handle("same_secret_user", "domain");
+        free_credentials_handle(&mut first);
+
+        assert_eq!(
+            initialize_ntlm_security_context(&mut stale),
+            ErrorKind::InvalidHandle.to_u32().unwrap()
+        );
+        assert_eq!(
+            initialize_ntlm_security_context(&mut second),
+            ContinueNeeded.to_u32().unwrap()
+        );
+        free_credentials_handle(&mut second);
+    }
+
+    #[test]
+    fn initialize_security_context_accepts_reactivated_freed_copy() {
+        let mut first = acquire_ntlm_credentials_handle("reactivated_user", "domain");
+        let mut stale = SecHandle {
+            dw_lower: first.dw_lower,
+            dw_upper: first.dw_upper,
+        };
+        free_credentials_handle(&mut first);
+
+        let mut second = acquire_ntlm_credentials_handle("reactivated_user", "domain");
+        assert_eq!(stale.dw_lower, second.dw_lower);
+        assert_eq!(
+            initialize_ntlm_security_context(&mut stale),
+            ContinueNeeded.to_u32().unwrap()
+        );
+        free_credentials_handle(&mut second);
+    }
+
+    #[test]
+    fn released_handle_reuse_ignores_changed_package_list() {
+        let mut registry = CredentialsRegistry::default();
+        let mut first_credentials = registry_credentials("package_list_user");
+        first_credentials.attributes.package_list = Some("NTLM".to_owned());
+        let first = registry.register(first_credentials).unwrap();
+        assert!(registry.release(first));
+
+        let second = registry.register(registry_credentials("package_list_user")).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            registry.live.get(&second).unwrap().credentials.attributes.package_list,
+            None
+        );
+    }
+
+    #[test]
+    fn released_handle_cache_evicts_oldest_entry_at_capacity() {
+        let mut registry = CredentialsRegistry::default();
+        let oldest = registry.register(registry_credentials("evicted_user")).unwrap();
+        assert!(registry.release(oldest));
+
+        for index in 0..MAX_RELEASED_CREDENTIALS - 1 {
+            let handle = registry
+                .register(registry_credentials(&format!("cache_user_{index}")))
+                .unwrap();
+            assert!(registry.release(handle));
+        }
+        assert_eq!(registry.released.len(), MAX_RELEASED_CREDENTIALS);
+        assert_eq!(registry.released.front().unwrap().1, oldest);
+
+        let newest = registry
+            .register(registry_credentials(&format!(
+                "cache_user_{}",
+                MAX_RELEASED_CREDENTIALS - 1
+            )))
+            .unwrap();
+        assert!(registry.release(newest));
+        assert_eq!(registry.released.len(), MAX_RELEASED_CREDENTIALS);
+        assert!(registry.released.iter().all(|(_, handle)| *handle != oldest));
+
+        let reused = registry
+            .register(registry_credentials(&format!(
+                "cache_user_{}",
+                MAX_RELEASED_CREDENTIALS - 1
+            )))
+            .unwrap();
+        assert_eq!(reused, newest);
+        assert_ne!(registry.register(registry_credentials("evicted_user")).unwrap(), oldest);
+    }
+
+    #[test]
+    fn acquire_credentials_handle_is_stable_after_free() {
+        let mut cred_handle = acquire_ntlm_credentials_handle("freed_user", "freed_domain");
+        let expected_handle = cred_handle.dw_lower;
+        free_credentials_handle(&mut cred_handle);
+
+        for _ in 0..3 {
+            let mut cred_handle = acquire_ntlm_credentials_handle("freed_user", "freed_domain");
+            assert_eq!(cred_handle.dw_lower, expected_handle);
+            free_credentials_handle(&mut cred_handle);
+        }
+    }
+
+    #[test]
+    fn acquire_credentials_handle_differs_for_different_credentials() {
+        let mut handles = ["user1", "user2", "user3"]
+            .into_iter()
+            .map(|user| acquire_ntlm_credentials_handle(user, "different_domain"))
+            .collect::<Vec<_>>();
+
+        let raw_handles = handles.iter().map(|handle| handle.dw_lower).collect::<Vec<_>>();
+        for (index, handle) in raw_handles.iter().enumerate() {
+            assert!(
+                !raw_handles[index + 1..].contains(handle),
+                "credentials handles must be different for different credentials: {raw_handles:?}"
+            );
+        }
+
+        handles.iter_mut().for_each(free_credentials_handle);
+    }
+
+    #[test]
+    fn initialize_security_context_dw_lower_is_stable() {
+        const OUT_BUFFER_LEN: usize = 4096;
+
+        let mut cred_handle = acquire_ntlm_credentials_handle("context_user", "context_domain");
+
+        let mut dw_lowers = Vec::new();
+
+        for _ in 0..3 {
+            let mut sec_context = SecHandle {
+                dw_lower: 0,
+                dw_upper: 0,
+            };
+            let mut new_sec_context = SecHandle {
+                dw_lower: 0,
+                dw_upper: 0,
+            };
+            let mut target_name = "TERMSRV/some@example.com\0".encode_utf16().collect::<Vec<_>>();
+            let mut attrs = 0;
+
+            let mut out_buffer = vec![0_u8; OUT_BUFFER_LEN];
+            let mut out_sec_buffer = SecBuffer {
+                cb_buffer: OUT_BUFFER_LEN.try_into().expect("out buffer length is a valid u32"),
+                buffer_type: 2, /* SECBUFFER_TOKEN */
+                pv_buffer: out_buffer.as_mut_ptr().cast(),
+            };
+            let mut out_buffer_desc = SecBufferDesc {
+                ul_version: 0,
+                c_buffers: 1,
+                p_buffers: &mut out_sec_buffer,
+            };
+            let mut in_buffer_desc = SecBufferDesc {
+                ul_version: 0,
+                c_buffers: 0,
+                p_buffers: null_mut::<SecBuffer>(),
+            };
+
+            let status = unsafe {
+                InitializeSecurityContextW(
+                    &mut cred_handle,
+                    &mut sec_context,
+                    target_name.as_mut_ptr(),
+                    0,
+                    0,
+                    0x10, /* SECURITY_NATIVE_DREP */
+                    &mut in_buffer_desc,
+                    0,
+                    &mut new_sec_context,
+                    &mut out_buffer_desc,
+                    &mut attrs,
+                    null_mut(),
+                )
+            };
+            assert_eq!(status, ContinueNeeded.to_u32().unwrap());
+
+            dw_lowers.push(new_sec_context.dw_lower);
+
+            let status = unsafe { DeleteSecurityContext(&mut new_sec_context) };
+            assert_eq!(status, 0);
+        }
+
+        assert!(
+            dw_lowers.windows(2).all(|pair| pair[0] == pair[1]),
+            "security context dw_lower must be the same for every context of the same package: {dw_lowers:?}"
+        );
+
+        free_credentials_handle(&mut cred_handle);
     }
 }

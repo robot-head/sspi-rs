@@ -2,26 +2,16 @@ use std::ffi::CStr;
 use std::mem::size_of;
 use std::ptr::copy_nonoverlapping;
 
+use ffi_types::sspi::SecurityStatus;
+pub use ffi_types::sspi::{
+    EnumerateSecurityPackagesFnA, EnumerateSecurityPackagesFnW, PSecPkgInfoA, PSecPkgInfoW,
+    QuerySecurityPackageInfoFnA, QuerySecurityPackageInfoFnW, SecChar, SecPkgInfoA, SecPkgInfoW, SecWChar,
+};
 use sspi::{
     Error, KERBEROS_VERSION, PackageInfo, U16CString, Utf16String, Utf16StringExt, enumerate_security_packages,
 };
 #[cfg(windows)]
 use symbol_rename_macro::rename_symbol;
-
-use super::sspi_data_types::{SecChar, SecWChar, SecurityStatus};
-
-#[derive(Debug)]
-#[repr(C)]
-pub struct SecPkgInfoW {
-    pub f_capabilities: u32,
-    pub w_version: u16,
-    pub w_rpc_id: u16,
-    pub cb_max_token: u32,
-    pub name: *mut SecWChar,
-    pub comment: *mut SecWChar,
-}
-
-pub type PSecPkgInfoW = *mut SecPkgInfoW;
 
 pub struct RawSecPkgInfoW(pub *mut SecPkgInfoW);
 
@@ -88,19 +78,6 @@ impl From<PackageInfo> for RawSecPkgInfoW {
         Self(raw_pkg_info.cast::<SecPkgInfoW>())
     }
 }
-
-#[derive(Debug)]
-#[repr(C)]
-pub struct SecPkgInfoA {
-    pub f_capabilities: u32,
-    pub w_version: u16,
-    pub w_rpc_id: u16,
-    pub cb_max_token: u32,
-    pub name: *mut SecChar,
-    pub comment: *mut SecChar,
-}
-
-pub type PSecPkgInfoA = *mut SecPkgInfoA;
 
 pub struct RawSecPkgInfoA(pub *mut SecPkgInfoA);
 
@@ -174,19 +151,7 @@ impl From<PackageInfo> for RawSecPkgInfoA {
     }
 }
 
-#[derive(Debug)]
-#[repr(C)]
-pub struct SecNegoInfoW {
-    pub package_info: *mut SecPkgInfoW,
-    pub nego_state: u32,
-}
-
-#[derive(Debug)]
-#[repr(C)]
-pub struct SecNegoInfoA {
-    pub package_info: *mut SecPkgInfoA,
-    pub nego_state: u32,
-}
+pub use ffi_types::sspi::{SecNegoInfoA, SecNegoInfoW};
 
 /// The `EnumerateSecurityPackagesA` function returns an array of `SecPkgInfo` structures that provide
 /// information about the `security packages` available to the client.
@@ -287,8 +252,6 @@ pub unsafe extern "system" fn EnumerateSecurityPackagesA(
     }
 }
 
-pub type EnumerateSecurityPackagesFnA = unsafe extern "system" fn(*mut u32, *mut PSecPkgInfoA) -> SecurityStatus;
-
 /// The `EnumerateSecurityPackagesW` function returns an array of `SecPkgInfo` structures that provide
 /// information about the `security packages` available to the client.
 ///
@@ -339,7 +302,7 @@ pub unsafe extern "system" fn EnumerateSecurityPackagesW(
         let mut package_ptr = raw_packages.cast::<SecPkgInfoW>();
         // SAFETY: It is safe to cast a pointer because we allocated enough memory to place package name and comment alongside SecPkgInfoA.
         let mut data_ptr = unsafe { raw_packages.add(size_of::<SecPkgInfoW>() * packages.len()).cast::<SecWChar>() };
-        for (i, pkg_info) in packages.iter().enumerate() {
+        for (pkg_info, (name, comment)) in packages.iter().zip(names.iter().zip(comments.iter())) {
             // FIXME(safety): it is illegal to construct a reference to uninitialized data
             // Useful references:
             // - https://doc.rust-lang.org/nomicon/unchecked-uninit.html
@@ -354,26 +317,26 @@ pub unsafe extern "system" fn EnumerateSecurityPackagesW(
             pkg_info_w.cb_max_token = pkg_info.max_token_len;
 
             // SAFETY:
-            // - `names[i]` is valid C string.
+            // - `name` is a valid C string.
             // - `data_ptr` is a local pointer to allocated memory.
             // - We precalculated and allocated enough memory to accommodate all security packages + their names and comments.
-            unsafe { copy_nonoverlapping(names[i].as_ptr(), data_ptr.cast(), names[i].len()); }
+            unsafe { copy_nonoverlapping(name.as_ptr(), data_ptr.cast(), name.len()); }
             pkg_info_w.name = data_ptr.cast();
             // SAFETY:
             // - Our allocated buffer is big enough to contain package name and comment.
             // - We precalculated and allocated enough memory to accommodate all security packages + their names and comments.
-            data_ptr = unsafe { data_ptr.add(names[i].len()) };
+            data_ptr = unsafe { data_ptr.add(name.len()) };
 
             // SAFETY:
-            // - `name` is valid C string.
+            // - `comment` is a valid C string.
             // - `data_ptr` is a local pointer to allocated memory.
             // - We precalculated and allocated enough memory to accommodate all security packages + their names and comments.
-            unsafe { copy_nonoverlapping(comments[i].as_ptr(), data_ptr.cast(), comments[i].len()); }
+            unsafe { copy_nonoverlapping(comment.as_ptr(), data_ptr.cast(), comment.len()); }
             pkg_info_w.comment = data_ptr.cast();
             // SAFETY:
             // - Our allocated buffer is big enough to contain package name and comment.
             // - We precalculated and allocated enough memory to accommodate all security packages + their names and comments.
-            data_ptr = unsafe { data_ptr.add(comments[i].len()) };
+            data_ptr = unsafe { data_ptr.add(comment.len()) };
 
             // SAFETY:
             // - Next structure (if any) is placed right after this structure.
@@ -387,8 +350,6 @@ pub unsafe extern "system" fn EnumerateSecurityPackagesW(
         0
     }
 }
-
-pub type EnumerateSecurityPackagesFnW = unsafe extern "system" fn(*mut u32, *mut PSecPkgInfoW) -> SecurityStatus;
 
 /// Retrieves information about a specified `security package`. This information includes the bounds on
 /// sizes of authentication information, credentials, and contexts.
@@ -430,8 +391,6 @@ pub unsafe extern "system" fn QuerySecurityPackageInfoA(
         0
     }
 }
-
-pub type QuerySecurityPackageInfoFnA = unsafe extern "system" fn(*const SecChar, *mut PSecPkgInfoA) -> SecurityStatus;
 
 /// Retrieves information about a specified `security package`. This information includes the bounds on
 /// sizes of authentication information, credentials, and contexts.
@@ -477,8 +436,6 @@ pub unsafe extern "system" fn QuerySecurityPackageInfoW(
         0
     }
 }
-
-pub type QuerySecurityPackageInfoFnW = unsafe extern "system" fn(*const SecWChar, *mut PSecPkgInfoW) -> SecurityStatus;
 
 #[cfg(test)]
 #[expect(

@@ -23,7 +23,7 @@ use self::extractors::{
 use self::generators::{
     ChecksumOptions, ChecksumValues, EncKey, GenerateAsPaDataOptions, GenerateAsReqOptions,
     GenerateAuthenticatorOptions, GenerateKeytabPaDataOptions, GenerateTgsReqOptions, GssFlags, generate_ap_rep,
-    generate_ap_req, generate_as_req_kdc_body, generate_authenticator, generate_tgs_req,
+    generate_ap_req, generate_as_req_kdc_body, generate_authenticator_at, generate_nonce, generate_tgs_req,
 };
 use self::principal::{
     ClientPrincipalName, get_client_principal_name, get_client_principal_name_type, get_client_principal_realm,
@@ -186,8 +186,7 @@ pub async fn initialize_security_context<'a>(
                 username: &username,
                 cname_type,
                 snames: &[TGT_SERVICE_NAME, &realm],
-                // 4 = size of u32
-                nonce: &rand.next_u32().to_be_bytes(),
+                nonce: generate_nonce(&mut rand),
                 hostname: &client.config.client_computer_name,
                 context_requirements: builder.context_requirements,
             };
@@ -237,7 +236,7 @@ pub async fn initialize_security_context<'a>(
                             smart_card.sign(digest)
                         }),
                         with_pre_auth: false,
-                        authenticator_nonce: rand.next_u32().to_be_bytes(),
+                        authenticator_nonce: generate_nonce(&mut rand),
                     }))
                 }
             };
@@ -316,14 +315,18 @@ pub async fn initialize_security_context<'a>(
             let mut hops = 0;
 
             let (tgs_rep, session_key_2) = loop {
-                let mut authenticator = generate_authenticator(GenerateAuthenticatorOptions {
-                    kdc_rep: &auth_rep,
-                    seq_num: Some(rand.next_u32()),
-                    sub_key: None,
-                    checksum: None,
-                    channel_bindings: client.channel_bindings.as_ref(),
-                    extensions: Vec::new(),
-                })?;
+                let now = client.current_kdc_time()?;
+                let mut authenticator = generate_authenticator_at(
+                    GenerateAuthenticatorOptions {
+                        kdc_rep: &auth_rep,
+                        seq_num: Some(rand.next_u32()),
+                        sub_key: None,
+                        checksum: None,
+                        channel_bindings: client.channel_bindings.as_ref(),
+                        extensions: Vec::new(),
+                    },
+                    now,
+                )?;
 
                 let tgs_req = generate_tgs_req(GenerateTgsReqOptions {
                     realm: &realm,
@@ -340,15 +343,15 @@ pub async fn initialize_security_context<'a>(
                     .send_for_realm(yield_point, &realm, &serialize_message(&tgs_req)?)
                     .await?;
 
-                if response.len() < 4 {
+                let Some(response) = response.get(4..) else {
                     return Err(Error::new(
                         ErrorKind::InternalError,
                         "the KDC reply message is too small: expected at least 4 bytes",
                     ));
-                }
+                };
 
                 // first 4 bytes are message len. skipping them
-                let mut d = picky_asn1_der::Deserializer::new_from_bytes(&response[4..]);
+                let mut d = picky_asn1_der::Deserializer::new_from_bytes(response);
                 let tgs_rep: KrbResult<TgsRep> = KrbResult::deserialize(&mut d)?;
                 let tgs_rep = tgs_rep?;
 
@@ -436,7 +439,8 @@ pub async fn initialize_security_context<'a>(
                 extensions: Vec::new(),
             };
 
-            let authenticator = generate_authenticator(authenticator_options)?;
+            let now = client.current_kdc_time()?;
+            let authenticator = generate_authenticator_at(authenticator_options, now)?;
 
             let ap_req = generate_ap_req(
                 tgs_rep.0.ticket.0,
