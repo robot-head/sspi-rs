@@ -206,6 +206,14 @@ impl Username {
         })
     }
 
+    pub(crate) fn new_qualified_down_level_logon_name(account_name: &str, netbios_domain_name: &str) -> Self {
+        Self {
+            value: format!("{netbios_domain_name}\\{account_name}"),
+            format: UserNameFormat::DownLevelLogonName,
+            sep_idx: Some(netbios_domain_name.len()),
+        }
+    }
+
     /// Attempts to guess the right name format for the account name/domain combo
     ///
     /// If no netbios domain name is provided, or if it is an empty string, the username will
@@ -821,7 +829,7 @@ mod tests {
             }
 
             // With no NetBIOS domain, `Username::new` falls back to `parse`, which reads an `@` as
-            // a UPN separator — only that combination can't reconstruct as a down-level logon name.
+            // a UPN separator; only that combination can't reconstruct as a down-level logon name.
             if domain.is_some() || !initial_username.account_name().contains('@') {
                 let netbios_name = Username::new(initial_username.account_name(), domain).expect("NetBIOS");
                 assert_eq!(netbios_name.format(), UserNameFormat::DownLevelLogonName);

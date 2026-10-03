@@ -198,11 +198,21 @@ namespace Devolutions.Sspi
         [DllImport(__DllName, EntryPoint = "AcquireCredentialsHandleW", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern uint AcquireCredentialsHandleW(ushort* _psz_principal, ushort* psz_package, uint _f_credential_use, void* _pv_logon_id, void* p_auth_data, delegate* unmanaged[Cdecl]<void*, void*, uint, void**, int*, void> _p_get_key_fn, void* _pv_get_key_argument, SecHandle* ph_credential, SecurityInteger* _pts_expiry);
 
+        /// <summary>
+        ///  # Safety
+        ///
+        ///  `ph_credential` must be null or a valid pointer to a `SecHandle` structure.
+        /// </summary>
         [DllImport(__DllName, EntryPoint = "QueryCredentialsAttributesA", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern uint QueryCredentialsAttributesA(SecHandle* _ph_credential, uint _ul_attribute, void* _p_buffer);
+        public static extern uint QueryCredentialsAttributesA(SecHandle* ph_credential, uint ul_attribute, void* _p_buffer);
 
+        /// <summary>
+        ///  # Safety
+        ///
+        ///  `ph_credential` must be null or a valid pointer to a `SecHandle` structure.
+        /// </summary>
         [DllImport(__DllName, EntryPoint = "QueryCredentialsAttributesW", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern uint QueryCredentialsAttributesW(SecHandle* _ph_credential, uint _ul_attribute, void* _p_buffer);
+        public static extern uint QueryCredentialsAttributesW(SecHandle* ph_credential, uint ul_attribute, void* _p_buffer);
 
         /// <summary>
         ///  The `InitializeSecurityContextA` function initiates the client side, outbound `security context` from
@@ -386,11 +396,21 @@ namespace Devolutions.Sspi
         [DllImport(__DllName, EntryPoint = "QueryContextAttributesExW", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern uint QueryContextAttributesExW(SecHandle* _ph_context, uint _ul_attribute, void* _p_buffer, uint _cb_buffer);
 
+        /// <summary>
+        ///  # Safety
+        ///
+        ///  `ph_credential` must be null or a valid pointer to a `SecHandle` structure.
+        /// </summary>
         [DllImport(__DllName, EntryPoint = "QueryCredentialsAttributesExA", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern uint QueryCredentialsAttributesExA(SecHandle* _ph_credential, uint _ul_attribute, void* _p_buffer, uint _c_buffers);
+        public static extern uint QueryCredentialsAttributesExA(SecHandle* ph_credential, uint ul_attribute, void* _p_buffer, uint _c_buffers);
 
+        /// <summary>
+        ///  # Safety
+        ///
+        ///  `ph_credential` must be null or a valid pointer to a `SecHandle` structure.
+        /// </summary>
         [DllImport(__DllName, EntryPoint = "QueryCredentialsAttributesExW", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern uint QueryCredentialsAttributesExW(SecHandle* _ph_aredential, uint _ul_attribute, void* _p_buffer, uint _c_buffers);
+        public static extern uint QueryCredentialsAttributesExW(SecHandle* ph_credential, uint ul_attribute, void* _p_buffer, uint _c_buffers);
 
         /// <summary>
         ///  The `EnumerateSecurityPackagesA` function returns an array of `SecPkgInfo` structures that provide
@@ -1207,35 +1227,6 @@ namespace Devolutions.Sspi
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    public unsafe partial struct SecHandle
-    {
-        public ulong dw_lower;
-        public ulong dw_upper;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public unsafe partial struct SecPkgInfoW
-    {
-        public uint f_capabilities;
-        public ushort w_version;
-        public ushort w_rpc_id;
-        public uint cb_max_token;
-        public ushort* name;
-        public ushort* comment;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public unsafe partial struct SecPkgInfoA
-    {
-        public uint f_capabilities;
-        public ushort w_version;
-        public ushort w_rpc_id;
-        public uint cb_max_token;
-        public byte* name;
-        public byte* comment;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
     public unsafe partial struct SecurityFunctionTableA
     {
         public uint dwVersion;
@@ -1311,6 +1302,61 @@ namespace Devolutions.Sspi
         public delegate* unmanaged[Cdecl]<SecHandle*, uint, void*, uint, uint> QueryCredentialsAttributesExW;
     }
 
+    /// <summary>
+    ///  [SECURITY_INTEGER](https://learn.microsoft.com/en-us/windows/win32/api/sspi/ns-sspi-security_integer)
+    ///
+    ///  ```c
+    ///  typedef struct _SECURITY_INTEGER {
+    ///    unsigned long LowPart;
+    ///    long          HighPart;
+    ///  } SECURITY_INTEGER, *PSECURITY_INTEGER;
+    ///  ```
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public unsafe partial struct SecurityInteger
+    {
+        public uint low_part;
+        public int high_part;
+    }
+
+    /// <summary>
+    ///  [SECURITY_STRING](https://learn.microsoft.com/en-us/windows/win32/api/sspi/ns-sspi-security_string)
+    ///
+    ///  The SECURITY_STRING structure is used as the string interface for kernel operations and is a clone
+    ///  of the [UNICODE_STRING](https://learn.microsoft.com/en-us/windows/win32/api/subauth/ns-subauth-unicode_string)
+    ///  structure. This is used for 32-bit mode.
+    ///
+    ///  ```c
+    ///  typedef struct _SECURITY_STRING {
+    ///    unsigned short Length;
+    ///    unsigned short MaximumLength;
+    ///    unsigned short *Buffer;
+    ///  } SECURITY_STRING, *PSECURITY_STRING;
+    ///  ```
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public unsafe partial struct SecurityString
+    {
+        public ushort length;
+        public ushort maximum_length;
+        public ushort* buffer;
+    }
+
+    /// <summary>
+    ///  [SecBuffer](https://learn.microsoft.com/en-us/windows/win32/api/sspi/ns-sspi-secbuffer)
+    ///
+    ///  ```c
+    ///  typedef struct _SecBuffer {
+    ///    unsigned long cbBuffer;
+    ///    unsigned long BufferType;
+    /// #if ...
+    ///    char          *pvBuffer;
+    /// #else
+    ///    void SEC_FAR  *pvBuffer;
+    /// #endif
+    ///  } SecBuffer, *PSecBuffer;
+    ///  ```
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public unsafe partial struct SecBuffer
     {
@@ -1319,6 +1365,17 @@ namespace Devolutions.Sspi
         public byte* pv_buffer;
     }
 
+    /// <summary>
+    ///  [SecBufferDesc](https://learn.microsoft.com/en-us/windows/win32/api/sspi/ns-sspi-secbufferdesc)
+    ///
+    ///  ```c
+    ///  typedef struct _SecBufferDesc {
+    ///    unsigned long ulVersion;
+    ///    unsigned long cBuffers;
+    ///    PSecBuffer    pBuffers;
+    ///  } SecBufferDesc, *PSecBufferDesc;
+    ///  ```
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public unsafe partial struct SecBufferDesc
     {
@@ -1327,19 +1384,74 @@ namespace Devolutions.Sspi
         public SecBuffer* p_buffers;
     }
 
+    /// <summary>
+    ///  Credentials or context handle, as defined by the SSPI API.
+    ///
+    ///  MSDN: [SSPI Handles](https://learn.microsoft.com/en-us/windows/win32/secauthn/sspi-handles).
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
-    public unsafe partial struct SecurityInteger
+    public unsafe partial struct SecHandle
     {
-        public uint low_part;
-        public int high_part;
+        /// <summary>
+        ///  If [SecHandle] is used as a context handle, this field contains the security package ID of the security context.
+        ///  If [SecHandle] is used as a credentials handle, this field contains the credentials handle pointer address.
+        /// </summary>
+        public ulong dw_lower;
+        /// <summary>
+        ///  If [SecHandle] is used as a context handle, this field contains the pointer to the security context.
+        ///  If [SecHandle] is used as a credentials handle, this field is unused.
+        /// </summary>
+        public ulong dw_upper;
     }
 
+    /// <summary>
+    ///  [SecPkgInfoW](https://learn.microsoft.com/en-us/windows/win32/api/sspi/ns-sspi-secpkginfow)
+    ///
+    ///  ```c
+    ///  typedef struct _SecPkgInfoW {
+    ///    unsigned long  fCapabilities;
+    ///    unsigned short wVersion;
+    ///    unsigned short wRPCID;
+    ///    unsigned long  cbMaxToken;
+    ///    SEC_WCHAR      *Name;
+    ///    SEC_WCHAR      *Comment;
+    ///  } SecPkgInfoW, *PSecPkgInfoW;
+    ///  ```
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
-    public unsafe partial struct SecurityString
+    public unsafe partial struct SecPkgInfoW
     {
-        public ushort length;
-        public ushort maximum_length;
-        public ushort* buffer;
+        public uint f_capabilities;
+        public ushort w_version;
+        public ushort w_rpc_id;
+        public uint cb_max_token;
+        public ushort* name;
+        public ushort* comment;
+    }
+
+    /// <summary>
+    ///  [SecPkgInfoA](https://learn.microsoft.com/en-us/windows/win32/api/sspi/ns-sspi-secpkginfoa)
+    ///
+    ///  ```c
+    ///  typedef struct _SecPkgInfoA {
+    ///    unsigned long  fCapabilities;
+    ///    unsigned short wVersion;
+    ///    unsigned short wRPCID;
+    ///    unsigned long  cbMaxToken;
+    ///    SEC_CHAR       *Name;
+    ///    SEC_CHAR       *Comment;
+    ///  } SecPkgInfoA, *PSecPkgInfoA;
+    ///  ```
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public unsafe partial struct SecPkgInfoA
+    {
+        public uint f_capabilities;
+        public ushort w_version;
+        public ushort w_rpc_id;
+        public uint cb_max_token;
+        public byte* name;
+        public byte* comment;
     }
 
     /// <summary>
