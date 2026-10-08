@@ -9,17 +9,17 @@ name: publish-krabka-sspi
 #
 # The publish job authenticates in one of two ways:
 #
-# - Token. When the `CARGO_REGISTRY_TOKEN` secret of the `crates-io`
-#   environment is set, cargo uses it. crates.io allows trusted publishing only
-#   for a crate that already exists, so the first publish of `krabka-sspi`
-#   needs this token.
-# - Trusted publishing. When the secret is not set,
+# - Token. The krabka-io organization secret `CARGO_REGISTRY_TOKEN`, which
+#   this repository inherits, is read as `secrets.CARGO_REGISTRY_TOKEN`. No
+#   repository or environment secret needs to be added. crates.io allows
+#   trusted publishing only for a crate that already exists, so the first
+#   publish of `krabka-sspi` uses this token.
+# - Trusted publishing. When the secret is not visible to the job,
 #   `rust-lang/crates-io-auth-action` exchanges the job's GitHub OIDC token for
 #   a crates.io token that expires after 30 minutes and is revoked at the end
 #   of the job.
 #
-# docs/krabka-sspi-release.md gives the procedure: bootstrap with the token,
-# configure trusted publishing, then delete the secret.
+# docs/krabka-sspi-release.md gives the procedure.
 #
 # A rerun is safe. The plan job asks crates.io whether the version exists and
 # skips the upload if it does.
@@ -44,7 +44,7 @@ env:
   CRATE: krabka-sspi
   TAG_PREFIX: krabka-sspi-v
   # crates.io refuses an API request without a User-Agent that names the caller.
-  USER_AGENT: krabka-sspi-publish (https://github.com/robot-head/sspi-rs)
+  USER_AGENT: krabka-sspi-publish (https://github.com/krabka-io/sspi-rs)
 
 jobs:
   # Checks that the ref is releasable, asks crates.io whether the version is
@@ -132,9 +132,9 @@ jobs:
     if: needs.plan.outputs.publish == 'true' && needs.plan.outputs.pending == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # crates.io's trusted-publisher entry for krabka-sspi names this
-    # environment. It also holds the bootstrap token, so the secret is
-    # unreadable to every other job and workflow.
+    # Restricted to `krabka-sspi-v*` tags, so only a release tag reaches the
+    # credential. crates.io's trusted-publisher entry for krabka-sspi, if one
+    # is configured, names this environment.
     environment: crates-io
     permissions:
       contents: read
@@ -150,10 +150,10 @@ jobs:
           HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
         run: |
           if [ "${HAS_TOKEN}" = true ]; then
-            echo 'CARGO_REGISTRY_TOKEN is set: publishing with the bootstrap token.'
+            echo 'CARGO_REGISTRY_TOKEN is visible: publishing with the krabka-io organization token.'
             echo mode=token >>"${GITHUB_OUTPUT}"
           else
-            echo 'CARGO_REGISTRY_TOKEN is not set: publishing through trusted publishing.'
+            echo 'CARGO_REGISTRY_TOKEN is not visible: publishing through trusted publishing.'
             echo mode=oidc >>"${GITHUB_OUTPUT}"
           fi
 
