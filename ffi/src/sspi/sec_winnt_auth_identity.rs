@@ -1,7 +1,15 @@
 use std::ptr::copy_nonoverlapping;
 use std::slice::from_raw_parts;
 
-use libc::{c_char, c_void};
+#[cfg(feature = "tsssp")]
+pub use ffi_types::sspi::{CredSspCred, CredSspSubmitType};
+pub use ffi_types::sspi::{
+    SEC_WINNT_AUTH_IDENTITY_ANSI, SEC_WINNT_AUTH_IDENTITY_UNICODE, SEC_WINNT_AUTH_IDENTITY_VERSION,
+    SEC_WINNT_AUTH_IDENTITY_VERSION_2, SecWinntAuthIdentityA, SecWinntAuthIdentityEx2, SecWinntAuthIdentityExA,
+    SecWinntAuthIdentityExW, SecWinntAuthIdentityW,
+};
+use ffi_types::sspi::{SecWChar, SecurityStatus};
+use libc::c_void;
 use sspi::utf16string::ZeroizedUtf16String;
 use sspi::{
     AuthIdentityBuffers, CredentialsBuffers, Error, ErrorKind, NonEmpty, Result, Secret, Utf16String, Utf16StringExt,
@@ -15,146 +23,10 @@ use windows::Win32::Security::Credentials::CredIsMarshaledCredentialW;
 #[cfg(feature = "tsssp")]
 use windows::Win32::Security::Credentials::{CREDUI_INFOW, CredUIPromptForWindowsCredentialsW};
 
-use super::sspi_data_types::{SecWChar, SecurityStatus};
 use crate::utils::{credentials_str_into_bytes, into_raw_ptr};
-
-pub const SEC_WINNT_AUTH_IDENTITY_ANSI: u32 = 0x1;
-pub const SEC_WINNT_AUTH_IDENTITY_UNICODE: u32 = 0x2;
 
 /// Environment variable name for specifying PKCS11 module path.
 pub const PKCS11_MODULE_PATH_ENV: &str = "SSPI_PKCS11_MODULE_PATH";
-
-#[repr(C)]
-pub struct SecWinntAuthIdentityW {
-    pub user: *const u16,
-    pub user_length: u32,
-    pub domain: *const u16,
-    pub domain_length: u32,
-    pub password: *const u16,
-    pub password_length: u32,
-    pub flags: u32,
-}
-
-#[repr(C)]
-pub struct SecWinntAuthIdentityA {
-    pub user: *const c_char,
-    pub user_length: u32,
-    pub domain: *const c_char,
-    pub domain_length: u32,
-    pub password: *const c_char,
-    pub password_length: u32,
-    pub flags: u32,
-}
-
-pub const SEC_WINNT_AUTH_IDENTITY_VERSION: u32 = 0x200;
-
-#[derive(Debug)]
-#[repr(C)]
-pub struct SecWinntAuthIdentityExW {
-    pub version: u32,
-    pub length: u32,
-    pub user: *const u16,
-    pub user_length: u32,
-    pub domain: *const u16,
-    pub domain_length: u32,
-    pub password: *const u16,
-    pub password_length: u32,
-    pub flags: u32,
-    pub package_list: *const u16,
-    pub package_list_length: u32,
-}
-
-#[repr(C)]
-pub struct SecWinntAuthIdentityExA {
-    pub version: u32,
-    pub length: u32,
-    pub user: *const c_char,
-    pub user_length: u32,
-    pub domain: *const c_char,
-    pub domain_length: u32,
-    pub password: *const c_char,
-    pub password_length: u32,
-    pub flags: u32,
-    pub package_list: *const c_char,
-    pub package_list_length: u32,
-}
-
-pub const SEC_WINNT_AUTH_IDENTITY_VERSION_2: u32 = 0x201;
-
-/// [SEC_WINNT_AUTH_IDENTITY_EX2](https://learn.microsoft.com/en-us/windows/win32/api/sspi/ns-sspi-sec_winnt_auth_identity_ex2)
-///
-/// ```not_rust
-/// typedef struct _SEC_WINNT_AUTH_IDENTITY_EX2 {
-///   unsigned long  Version;
-///   unsigned short cbHeaderLength;
-///   unsigned long  cbStructureLength;
-///   unsigned long  UserOffset;
-///   unsigned short UserLength;
-///   unsigned long  DomainOffset;
-///   unsigned short DomainLength;
-///   unsigned long  PackedCredentialsOffset;
-///   unsigned short PackedCredentialsLength;
-///   unsigned long  Flags;
-///   unsigned long  PackageListOffset;
-///   unsigned short PackageListLength;
-/// } SEC_WINNT_AUTH_IDENTITY_EX2, *PSEC_WINNT_AUTH_IDENTITY_EX2;
-/// ```
-#[derive(Debug)]
-#[repr(C)]
-pub struct SecWinntAuthIdentityEx2 {
-    pub version: u32,
-    pub cb_header_length: u16,
-    pub cb_structure_length: u32,
-    pub user_offset: u32,
-    pub user_length: u16,
-    pub domain_offset: u32,
-    pub domain_length: u16,
-    pub packed_credentials_offset: u32,
-    pub packed_credentials_length: u16,
-    pub flags: u32,
-    pub package_list_offset: u32,
-    pub package_list_length: u16,
-}
-
-/// [CREDSPP_SUBMIT_TYPE](https://learn.microsoft.com/en-us/windows/win32/api/credssp/ne-credssp-credspp_submit_type)
-///
-/// ```not_rust
-/// typedef enum _CREDSSP_SUBMIT_TYPE {
-///   CredsspPasswordCreds = 2,
-///   CredsspSchannelCreds = 4,
-///   CredsspCertificateCreds = 13,
-///   CredsspSubmitBufferBoth = 50,
-///   CredsspSubmitBufferBothOld = 51,
-///   CredsspCredEx = 100
-/// } CREDSPP_SUBMIT_TYPE;
-/// ```
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-#[repr(C)]
-pub enum CredSspSubmitType {
-    CredsspPasswordCreds = 2,
-    CredsspSchannelCreds = 4,
-    CredsspCertificateCreds = 13,
-    CredsspSubmitBufferBoth = 50,
-    CredsspSubmitBufferBothOld = 51,
-    CredsspCredEx = 100,
-}
-
-/// [CREDSSP_CRED](https://learn.microsoft.com/en-us/windows/win32/api/credssp/ns-credssp-credssp_cred)
-///
-/// ```not_rust
-/// typedef struct _CREDSSP_CRED {
-///   CREDSPP_SUBMIT_TYPE Type;
-///   PVOID               pSchannelCred;
-///   PVOID               pSpnegoCred;
-/// } CREDSSP_CRED, *PCREDSSP_CRED;
-/// ```
-#[derive(Debug)]
-#[repr(C)]
-pub struct CredSspCred {
-    pub submit_type: CredSspSubmitType,
-    pub p_schannel_cred: *const c_void,
-    pub p_spnego_cred: *const c_void,
-}
 
 /// Returns auth identity version and flags.
 ///
@@ -232,7 +104,7 @@ unsafe fn credssp_auth_data_to_identity_buffers(p_auth_data: *const c_void) -> R
                 .to_bytes_with_nul();
 
             let cred_ui_info = CREDUI_INFOW {
-                cbSize: size_of::<CREDUI_INFOW>().try_into().unwrap(),
+                cbSize: size_of::<CREDUI_INFOW>().try_into()?,
                 hwndParent: HWND::default(),
                 pszMessageText: PCWSTR::from_raw(message.as_ptr().cast()),
                 pszCaptionText: PCWSTR::from_raw(caption.as_ptr().cast()),
@@ -376,32 +248,33 @@ pub unsafe fn auth_data_to_identity_buffers_a(
         let auth_data = unsafe { auth_data.as_ref() }.expect("auth_data pointer should not be null");
 
         if !auth_data.package_list.is_null() && auth_data.package_list_length > 0 {
+            let package_list_length = auth_data.package_list_length.try_into()?;
             *package_list = Some(
                 // SAFETY: `auth_data.package_list` is a non-null pointer to a valid buffer valid for reads of `auth_data.package_list_length` bytes.
-                String::from_utf8_lossy(unsafe {
-                    from_raw_parts(auth_data.package_list.cast(), auth_data.package_list_length as usize)
-                })
-                .to_string(),
+                String::from_utf8_lossy(unsafe { from_raw_parts(auth_data.package_list.cast(), package_list_length) })
+                    .to_string(),
             );
         }
 
+        let user_length = auth_data.user_length.try_into()?;
         // SAFETY:
         // - Credentials pointers can be NULL.
         // - If credentials are not NULL, then the caller is responsible for the data validity.
-        let username_data = unsafe { credentials_str_into_bytes(auth_data.user, auth_data.user_length as usize) };
+        let username_data = unsafe { credentials_str_into_bytes(auth_data.user, user_length) };
         let user = Utf16String::from_utf8_bytes(username_data)?.to_bytes_le();
 
+        let domain_length = auth_data.domain_length.try_into()?;
         // SAFETY:
         // - Credentials pointers can be NULL.
         // - If credentials are not NULL, then the caller is responsible for the data validity.
-        let domain_data = unsafe { credentials_str_into_bytes(auth_data.domain, auth_data.domain_length as usize) };
+        let domain_data = unsafe { credentials_str_into_bytes(auth_data.domain, domain_length) };
         let domain = Utf16String::from_utf8_bytes(domain_data)?.to_bytes_le();
 
+        let password_length = auth_data.password_length.try_into()?;
         // SAFETY:
         // - Credentials pointers can be NULL.
         // - If credentials are not NULL, then the caller is responsible for the data validity.
-        let password_data =
-            unsafe { credentials_str_into_bytes(auth_data.password, auth_data.password_length as usize) };
+        let password_data = unsafe { credentials_str_into_bytes(auth_data.password, password_length) };
         let password = Utf16String::from_utf8_bytes(password_data)?.to_bytes_le();
 
         // Try to collect credentials for the emulated/system-provided smart card.
@@ -422,23 +295,25 @@ pub unsafe fn auth_data_to_identity_buffers_a(
         // that points to a valid `SecWinntAuthIdentityA` structure.
         let auth_data = unsafe { auth_data.as_ref() }.expect("auth_data pointer should not be null");
 
+        let user_length = auth_data.user_length.try_into()?;
         // SAFETY:
         // - Credentials pointers can be NULL.
         // - If credentials are not NULL, then the caller is responsible for the data validity.
-        let username_data = unsafe { credentials_str_into_bytes(auth_data.user, auth_data.user_length as usize) };
+        let username_data = unsafe { credentials_str_into_bytes(auth_data.user, user_length) };
         let user = Utf16String::from_utf8_bytes(username_data)?.to_bytes_le();
 
+        let domain_length = auth_data.domain_length.try_into()?;
         // SAFETY:
         // - Credentials pointers can be NULL.
         // - If credentials are not NULL, then the caller is responsible for the data validity.
-        let domain_data = unsafe { credentials_str_into_bytes(auth_data.domain, auth_data.domain_length as usize) };
+        let domain_data = unsafe { credentials_str_into_bytes(auth_data.domain, domain_length) };
         let domain = Utf16String::from_utf8_bytes(domain_data)?.to_bytes_le();
 
+        let password_length = auth_data.password_length.try_into()?;
         // SAFETY:
         // - Credentials pointers can be NULL.
         // - If credentials are not NULL, then the caller is responsible for the data validity.
-        let password_data =
-            unsafe { credentials_str_into_bytes(auth_data.password, auth_data.password_length as usize) };
+        let password_data = unsafe { credentials_str_into_bytes(auth_data.password, password_length) };
         let password = Utf16String::from_utf8_bytes(password_data)?.to_bytes_le();
 
         // Try to collect credentials for the emulated/system-provided smart card.
@@ -477,57 +352,56 @@ pub unsafe fn auth_data_to_identity_buffers_w(
     //   structure, depending on the `auth_version`.
     let (auth_version, _) = unsafe { get_auth_data_identity_version_and_flags(p_auth_data) };
 
-    let (user, user_len, domain, domain_len, password, password_len) = if auth_version
-        == SEC_WINNT_AUTH_IDENTITY_VERSION
-    {
-        let auth_data = p_auth_data.cast::<SecWinntAuthIdentityExW>();
-        // SAFETY: `auth_data` is not null. We've checked this above.
-        let auth_data = unsafe { auth_data.as_ref() }.expect("auth_data pointer should not be null");
+    let (user, user_len, domain, domain_len, password, password_len) =
+        if auth_version == SEC_WINNT_AUTH_IDENTITY_VERSION {
+            let auth_data = p_auth_data.cast::<SecWinntAuthIdentityExW>();
+            // SAFETY: `auth_data` is not null. We've checked this above.
+            let auth_data = unsafe { auth_data.as_ref() }.expect("auth_data pointer should not be null");
 
-        if !auth_data.package_list.is_null() && auth_data.package_list_length > 0 {
-            let package_list_length = usize::try_from(auth_data.package_list_length).expect("u32 is castable to usize");
+            if !auth_data.package_list.is_null() && auth_data.package_list_length > 0 {
+                let package_list_length = auth_data.package_list_length.try_into()?;
 
-            // SAFETY: `package_list` is not null due to a prior check.
-            let package_list_data = unsafe { from_raw_parts(auth_data.package_list, package_list_length) };
-            *package_list = Some(String::from_utf16(package_list_data)?);
-        }
+                // SAFETY: `package_list` is not null due to a prior check.
+                let package_list_data = unsafe { from_raw_parts(auth_data.package_list, package_list_length) };
+                *package_list = Some(String::from_utf16(package_list_data)?);
+            }
 
-        (
-            auth_data.user,
-            auth_data.user_length,
-            auth_data.domain,
-            auth_data.domain_length,
-            auth_data.password,
-            auth_data.password_length,
-        )
-    } else {
-        let auth_data = p_auth_data.cast::<SecWinntAuthIdentityW>();
-        // SAFETY: `auth_data` is not null. We've checked this above.
-        let auth_data = unsafe { auth_data.as_ref() }.expect("auth_data pointer should not be null");
+            (
+                auth_data.user,
+                auth_data.user_length,
+                auth_data.domain,
+                auth_data.domain_length,
+                auth_data.password,
+                auth_data.password_length,
+            )
+        } else {
+            let auth_data = p_auth_data.cast::<SecWinntAuthIdentityW>();
+            // SAFETY: `auth_data` is not null. We've checked this above.
+            let auth_data = unsafe { auth_data.as_ref() }.expect("auth_data pointer should not be null");
 
-        (
-            auth_data.user,
-            auth_data.user_length,
-            auth_data.domain,
-            auth_data.domain_length,
-            auth_data.password,
-            auth_data.password_length,
-        )
-    };
+            (
+                auth_data.user,
+                auth_data.user_length,
+                auth_data.domain,
+                auth_data.domain_length,
+                auth_data.password,
+                auth_data.password_length,
+            )
+        };
 
     // SAFETY:
     // - Credentials pointers can be NULL.
     // - If credentials are not NULL, then the caller is responsible for the data validity.
-    let user = unsafe { credentials_str_into_bytes(user.cast(), user_len as usize * 2) };
+    let user = unsafe { credentials_str_into_bytes(user.cast(), usize::try_from(user_len)? * 2) };
     // SAFETY:
     // - Credentials pointers can be NULL.
     // - If credentials are not NULL, then the caller is responsible for the data validity.
-    let domain = unsafe { credentials_str_into_bytes(domain.cast(), domain_len as usize * 2) };
+    let domain = unsafe { credentials_str_into_bytes(domain.cast(), usize::try_from(domain_len)? * 2) };
     let password: Secret<Vec<u8>> =
         // SAFETY:
         // - Credentials pointers can be NULL.
         // - If credentials are not NULL, then the caller is responsible for the data validity.
-        unsafe { credentials_str_into_bytes(password.cast(), password_len as usize * 2) }.into();
+        unsafe { credentials_str_into_bytes(password.cast(), usize::try_from(password_len)? * 2) }.into();
 
     let mut username = user.clone();
     username.extend_from_slice(&[0, 0]);
@@ -702,7 +576,7 @@ unsafe fn get_sec_winnt_auth_identity_ex2_size(p_auth_data: *const c_void) -> Re
     // https://github.com/FreeRDP/FreeRDP/blob/master/winpr/libwinpr/sspi/sspi_winpr.c#L473
 
     // SAFETY: Username length is placed after the first 8 bytes, according to the documentation.
-    let user_len_ptr = unsafe { (p_auth_data as *const u16).add(4) };
+    let user_len_ptr = unsafe { (p_auth_data.cast::<u16>()).add(4) };
     if user_len_ptr.is_null() {
         return Err(Error::new(
             ErrorKind::InvalidParameter,
@@ -710,7 +584,7 @@ unsafe fn get_sec_winnt_auth_identity_ex2_size(p_auth_data: *const c_void) -> Re
         ));
     }
     // SAFETY: `user_len_ptr` is guaranteed to be non-null due to the prior check.
-    let user_buffer_len = unsafe { *user_len_ptr as u32 };
+    let user_buffer_len = u32::from(unsafe { *user_len_ptr });
 
     // SAFETY: Domain length is placed after 16 bytes from the username length, according to the documentation.
     let domain_len_ptr = unsafe { user_len_ptr.add(8) };
@@ -721,7 +595,7 @@ unsafe fn get_sec_winnt_auth_identity_ex2_size(p_auth_data: *const c_void) -> Re
         ));
     }
     // SAFETY: `domain_len_ptr` is guaranteed to be non-null due to the prior check.
-    let domain_buffer_len = unsafe { *domain_len_ptr as u32 };
+    let domain_buffer_len = u32::from(unsafe { *domain_len_ptr });
 
     // SAFETY: Packet credentials length is placed after 16 bytes from the domain length
     let creds_len_ptr = unsafe { domain_len_ptr.add(8) };
@@ -732,7 +606,7 @@ unsafe fn get_sec_winnt_auth_identity_ex2_size(p_auth_data: *const c_void) -> Re
         ));
     }
     // SAFETY: `creds_len_ptr` is guaranteed to be non-null due to the prior check.
-    let creds_buffer_len = unsafe { *creds_len_ptr as u32 };
+    let creds_buffer_len = u32::from(unsafe { *creds_len_ptr });
 
     // The resulting size is equal to the header size + buffers size.
     Ok(64 /* size of the SEC_WINNT_AUTH_IDENTITY_EX2 */ + user_buffer_len + domain_buffer_len + creds_buffer_len)
@@ -798,9 +672,9 @@ pub unsafe fn unpack_sec_winnt_auth_identity_ex2_a(p_auth_data: *const c_void) -
         Err(_) => (),
     };
 
-    let mut username = vec![0_u8; username_len as usize];
-    let mut domain = vec![0_u8; domain_len as usize];
-    let mut password = Secret::new(vec![0_u8; password_len as usize]);
+    let mut username = vec![0_u8; username_len.try_into()?];
+    let mut domain = vec![0_u8; domain_len.try_into()?];
+    let mut password = Secret::new(vec![0_u8; password_len.try_into()?]);
 
     // Knowing the actual sizes, we can unpack credentials into prepared buffers.
     //
@@ -837,9 +711,9 @@ pub unsafe fn unpack_sec_winnt_auth_identity_ex2_a(p_auth_data: *const c_void) -
 
     if domain_len == 0 {
         // Sometimes username can be formatted as `DOMAIN\username`.
-        if let Some(index) = username.find('\\') {
-            auth_identity_buffers.domain = Utf16String::from_str(&username[0..index]);
-            auth_identity_buffers.user = Utf16String::from_str(&username[(index + 1)..]);
+        if let Some((domain, user)) = username.split_once('\\') {
+            auth_identity_buffers.domain = Utf16String::from_str(domain);
+            auth_identity_buffers.user = Utf16String::from_str(user);
         } else {
             auth_identity_buffers.user = Utf16String::from_str(username);
         }
@@ -1040,9 +914,9 @@ pub unsafe fn unpack_sec_winnt_auth_identity_ex2_w_sized(
         Err(_) => (),
     };
 
-    let mut username = vec![0_u8; username_len as usize * 2];
-    let mut domain = vec![0_u8; domain_len as usize * 2];
-    let mut password = Secret::new(vec![0_u8; password_len as usize * 2]);
+    let mut username = vec![0_u8; usize::try_from(username_len)? * 2];
+    let mut domain = vec![0_u8; usize::try_from(domain_len)? * 2];
+    let mut password = Secret::new(vec![0_u8; usize::try_from(password_len)? * 2]);
 
     // SAFETY: `p_auth_data` is guaranteed to be non-null due to the prior check.
     let result = unsafe {
@@ -1090,19 +964,10 @@ pub unsafe fn unpack_sec_winnt_auth_identity_ex2_w_sized(
     auth_identity_buffers.user = Utf16String::from_bytes_le(username)?;
 
     if domain_len == 0 {
-        // '\\' char in UTF-16LE encoding.
-        const BACK_SLASH_UTF16: [u8; 2] = [b'\\', 0];
         // Sometimes username can be formatted as `DOMAIN\username`.
-        if let Some(index) = auth_identity_buffers
-            .user
-            .as_bytes_le()
-            .windows(2)
-            .position(|b| b == BACK_SLASH_UTF16)
-        {
-            auth_identity_buffers.domain =
-                Utf16String::from_bytes_le(&auth_identity_buffers.user.as_bytes_le()[0..index])?;
-            auth_identity_buffers.user =
-                Utf16String::from_bytes_le(&auth_identity_buffers.user.as_bytes_le()[(index + 2)..])?;
+        if let Some((domain, user)) = auth_identity_buffers.user.to_string().split_once('\\') {
+            auth_identity_buffers.domain = Utf16String::from_str(domain);
+            auth_identity_buffers.user = Utf16String::from_str(user);
         }
     } else {
         // In the `auth_identity_buffers` structure we hold credentials as raw wide string without NULL-terminator bytes.
@@ -1180,7 +1045,7 @@ pub unsafe extern "system" fn SspiEncodeStringsAsAuthIdentity(
         }
 
         // SAFETY: Memory allocation is safe.
-        let user = unsafe { libc::malloc(user_length * 2) as *mut SecWChar };
+        let user = unsafe { libc::malloc(user_length * 2).cast::<SecWChar>() };
         if user.is_null() {
             return ErrorKind::InternalError.to_u32().unwrap();
         }
@@ -1191,7 +1056,7 @@ pub unsafe extern "system" fn SspiEncodeStringsAsAuthIdentity(
         unsafe { copy_nonoverlapping(psz_user_name, user, user_length) };
 
         // SAFETY: Memory allocation is safe.
-        let domain = unsafe { libc::malloc(domain_length * 2) as *mut SecWChar };
+        let domain = unsafe { libc::malloc(domain_length * 2).cast::<SecWChar>() };
         if domain.is_null() {
             return ErrorKind::InternalError.to_u32().unwrap();
         }
@@ -1202,7 +1067,7 @@ pub unsafe extern "system" fn SspiEncodeStringsAsAuthIdentity(
         unsafe { copy_nonoverlapping(psz_domain_name, domain, domain_length) };
 
         // SAFETY: Memory allocation is safe.
-        let password = unsafe { libc::malloc(password_length * 2) as *mut SecWChar };
+        let password = unsafe { libc::malloc(password_length * 2).cast::<SecWChar>() };
         if password.is_null() {
             return ErrorKind::InternalError.to_u32().unwrap();
         }
@@ -1222,8 +1087,9 @@ pub unsafe extern "system" fn SspiEncodeStringsAsAuthIdentity(
             flags: 0,
         };
 
+        let auth_identity_ptr = into_raw_ptr(auth_identity).cast::<c_void>();
         // SAFETY: `pp_auth_identity` is guaranteed to be non-null due to the prior check.
-        unsafe { *pp_auth_identity = into_raw_ptr(auth_identity) as *mut c_void; }
+        unsafe { *pp_auth_identity = auth_identity_ptr; }
 
         0
     }
@@ -1308,21 +1174,34 @@ mod tests {
         let identity = identity.cast::<SecWinntAuthIdentityW>();
         let identity = unsafe { identity.as_mut() }.expect("identity is not null");
 
+        let user_length = identity
+            .user_length
+            .try_into()
+            .expect("user_length should fit into usize");
+        let password_length = identity
+            .password_length
+            .try_into()
+            .expect("password_length should fit into usize");
+        let domain_length = identity
+            .domain_length
+            .try_into()
+            .expect("domain_length should fit into usize");
+
         assert_eq!(
             "user",
-            String::from_utf16(unsafe { from_raw_parts(identity.user, identity.user_length as usize) })
+            String::from_utf16(unsafe { from_raw_parts(identity.user, user_length) })
                 .expect("user is a correct utf-16 string")
         );
 
         assert_eq!(
             "pass",
-            String::from_utf16(unsafe { from_raw_parts(identity.password, identity.password_length as usize) })
+            String::from_utf16(unsafe { from_raw_parts(identity.password, password_length) })
                 .expect("password is a correct utf-16 string")
         );
 
         assert_eq!(
             "domain",
-            String::from_utf16(unsafe { from_raw_parts(identity.domain, identity.domain_length as usize) })
+            String::from_utf16(unsafe { from_raw_parts(identity.domain, domain_length) })
                 .expect("domain is a correct utf-16 string")
         );
 

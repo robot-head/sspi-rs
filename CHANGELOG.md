@@ -6,6 +6,151 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [krabka-sspi 0.23.0] - unreleased
+
+First release of `krabka-sspi`, a temporary fork of upstream `sspi` 0.23.0
+published for krabka (see "About krabka-sspi" in the README). The library is
+upstream `sspi` 0.23.0 with these changes:
+
+### Bug Fixes
+
+- Accept an AS-REP whose encrypted part is tagged `EncTGSRepPart`, as MIT KDCs send and RFC 4120 section 5.4.2 permits ([#738](https://github.com/Devolutions/sspi-rs/pull/738))
+- Kerberos acceptor: take the encryption type from the service ticket's session key, so integrity-only GSS wrap tokens from MIT clients verify with the negotiated AES suite ([#738](https://github.com/Devolutions/sspi-rs/pull/738))
+- Map `GssApiMessageError::InvalidMechanismOid` to `ErrorKind::InvalidToken` ([#764](https://github.com/Devolutions/sspi-rs/pull/764))
+
+### Features
+
+- Re-export `SecretPrivateKey` from the crate root ([#764](https://github.com/Devolutions/sspi-rs/pull/764))
+
+### Build
+
+- Require `picky-krb` 0.13 (0.12.5 was yanked; 0.13.0 republishes it), `picky-asn1-der` 0.5.7 and `picky-asn1-x509` 0.15.5 ([#764](https://github.com/Devolutions/sspi-rs/pull/764))
+- Publish as `krabka-sspi` with library name `sspi`
+
+
+
+## [[0.23.0](https://github.com/Devolutions/sspi-rs/compare/sspi-v0.22.1...sspi-v0.23.0)] - 2026-10-01
+
+### <!-- 1 -->Features
+
+- [**breaking**] Upgrade `winscard` to 0.4, so the public `From<winscard::Error> for sspi::Error` conversion now uses the `winscard` 0.4 error type ([#755](https://github.com/Devolutions/sspi-rs/issues/755)) ([37ebbb8dcd](https://github.com/Devolutions/sspi-rs/commit/37ebbb8dcd07de8bdbacf2662508683213d6590c))
+
+### <!-- 4 -->Bug Fixes
+
+- Encode the Kerberos KDC-REQ nonce as a minimal DER positive 32-bit integer, fixing intermittent `KRB_AP_ERR_MODIFIED` failures from Windows KDCs ([#759](https://github.com/Devolutions/sspi-rs/issues/759)) ([c724a94076](https://github.com/Devolutions/sspi-rs/commit/c724a940763a115f4458195663aba69c49c20b4f))
+- Accept AP-REP sequence numbers of any valid DER length, fixing intermittent mutual authentication failures against Windows acceptors ([#759](https://github.com/Devolutions/sspi-rs/issues/759)) ([c724a94076](https://github.com/Devolutions/sspi-rs/commit/c724a940763a115f4458195663aba69c49c20b4f))
+
+
+
+## [[0.22.1](https://github.com/Devolutions/sspi-rs/compare/sspi-v0.22.0...sspi-v0.22.1)] - 2026-09-29
+
+### <!-- 4 -->Bug Fixes
+
+- Preserve the NTLM RC4 sealing state across MIC generation and verification ([#753](https://github.com/Devolutions/sspi-rs/issues/753)) ([5b2b137e13](https://github.com/Devolutions/sspi-rs/commit/5b2b137e13b6839790049727bdb742e967cb1248))
+
+  Generating or verifying a MIC no longer resets the NTLM RC4 sealing
+  handles, so a message sealed right after a MIC keeps the correct state.
+  CredSSP relies on this: it wraps `pubKeyAuth` after the initiator sends
+  its `mechListMIC` but before it verifies the acceptor's MIC, and the
+  previous reset dropped the advanced send state, corrupting the next
+  wrapped message. Sequence numbers are unchanged.
+
+- Recover from KDC clock skew during the Kerberos AS exchange ([#757](https://github.com/Devolutions/sspi-rs/issues/757)) ([24c9c52352](https://github.com/Devolutions/sspi-rs/commit/24c9c5235204174e8d64b685c7633794a07fcc68))
+
+  When a KDC rejects encrypted AS pre-authentication with
+  `KRB_AP_ERR_SKEW`, the client derives the KDC time offset from the
+  error's `stime`/`susec` and retries once; a second skew error or any
+  other error is returned as before. The offset is applied to password,
+  keytab, and smart-card pre-authentication timestamps, and to subsequent
+  TGS, AP, and password-change authenticators, so Kerberos logon succeeds
+  when the local clock differs from the KDC's.
+
+## [[0.22.0](https://github.com/Devolutions/sspi-rs/compare/sspi-v0.21.3...sspi-v0.22.0)] - 2026-09-15
+
+### <!-- 1 -->Features
+
+- Add PKU2U acceptor support with configurable additional credentials and trusted client and server certificates ([#733](https://github.com/Devolutions/sspi-rs/issues/733)) ([03ee8d0128](https://github.com/Devolutions/sspi-rs/commit/03ee8d012835d9d46f69a181e3b199427c7b0856))
+
+- Expose `Pku2uCredential` and `Pku2uPrivateKey` for PKU2U authentication configuration ([#733](https://github.com/Devolutions/sspi-rs/issues/733)) ([03ee8d0128](https://github.com/Devolutions/sspi-rs/commit/03ee8d012835d9d46f69a181e3b199427c7b0856))
+
+### <!-- 2 -->Improvements
+
+- [**breaking**] Make `credssp::ts_request::TsRequest::buffer_len()` return `Result<u16>` ([#721](https://github.com/Devolutions/sspi-rs/issues/721)) ([a9dfaec9b0](https://github.com/Devolutions/sspi-rs/commit/a9dfaec9b04ce06a487f6091890f9a1baf620005))
+
+- [**breaking**] Change `kerberos::MAX_SIGNATURE` and `kerberos::SECURITY_TRAILER` to `u8` ([#721](https://github.com/Devolutions/sspi-rs/issues/721)) ([a9dfaec9b0](https://github.com/Devolutions/sspi-rs/commit/a9dfaec9b04ce06a487f6091890f9a1baf620005))
+
+### <!-- 4 -->Bug Fixes
+
+- Preserve peer sequence numbers during Kerberos AP-REP and MIC validation ([#717](https://github.com/Devolutions/sspi-rs/issues/717)) ([6d177082ed](https://github.com/Devolutions/sspi-rs/commit/6d177082edba57563f8be310ca4776673b247d82))
+
+- Accept `@` in down-level account names ([#719](https://github.com/Devolutions/sspi-rs/issues/719)) ([4878c50503](https://github.com/Devolutions/sspi-rs/commit/4878c50503b204bba95def66ca7d45e6d396f898))
+
+- Map `ClientRequestFlags::EXTENDED_ERROR` and `ClientRequestFlags::IDENTIFY` to Kerberos GSS request flags ([#736](https://github.com/Devolutions/sspi-rs/issues/736)) ([0fb18798dd](https://github.com/Devolutions/sspi-rs/commit/0fb18798ddc40c487e0503631b93879c975af398))
+
+- Generate and validate Kerberos MICs using the negotiated AES key size ([#737](https://github.com/Devolutions/sspi-rs/issues/737)) ([7a3de33074](https://github.com/Devolutions/sspi-rs/commit/7a3de330748fd9f8848507765ec2824be5c56f40))
+
+### <!-- 7 -->Build
+
+- [**breaking**] Raise the minimum supported Rust version to 1.93 ([#715](https://github.com/Devolutions/sspi-rs/issues/715)) ([5f85f13a15](https://github.com/Devolutions/sspi-rs/commit/5f85f13a15255cab1185801b64b0437fd9605a3f))
+
+
+
+## [[0.21.3](https://github.com/Devolutions/sspi-rs/compare/sspi-v0.21.2...sspi-v0.21.3)] - 2026-07-16
+
+### <!-- 1 -->Features
+
+- Add format-tagged Username::parts view ([#709](https://github.com/Devolutions/sspi-rs/issues/709)) ([80492e4c61](https://github.com/Devolutions/sspi-rs/commit/80492e4c616f7e475391d9b877759b463733fe82)) 
+
+  Add `UsernameParts`, a format-tagged, borrowed view into a `Username`,
+  and `Username::parts()` returning it. Each variant only exposes the
+  fields that are meaningful for its user name format, so a UPN suffix can
+  no longer be mistaken for a NetBIOS domain: the `UserPrincipalName` arm
+  has a `suffix` (and the full `upn`) but no "domain" field, while
+  `DownLevelLogonName` carries an `Option<netbios_domain>` that models
+  accurately the no-separator case. Matching is exhaustive over the two
+  Microsoft user name formats.
+
+## [[0.21.2](https://github.com/Devolutions/sspi-rs/compare/sspi-v0.21.1...sspi-v0.21.2)] - 2026-07-15
+
+### <!-- 4 -->Bug Fixes
+
+- Classify UPN keytab principals as NT_ENTERPRISE ([#475](https://github.com/Devolutions/sspi-rs/issues/475)) ([491cf36fea](https://github.com/Devolutions/sspi-rs/commit/491cf36feafb01dac9490842d2472acc3602ffcb)) 
+
+  The keytab credentials branch passed keytab.principal.account_name() to
+  get_client_principal_name_type, which strips the @suffix of a UPN. Without
+  the @, the principal was misclassified as NT_PRINCIPAL instead of
+  NT_ENTERPRISE (MS-KILE 3.3.5.6.1).
+
+- Avoid panic on short SRV record RDATA on macOS ([#706](https://github.com/Devolutions/sspi-rs/issues/706)) ([a4ab1bbf0c](https://github.com/Devolutions/sspi-rs/commit/a4ab1bbf0c1c214e921a3189264885c7c278e909))
+
+## [[0.21.1](https://github.com/Devolutions/sspi-rs/compare/sspi-v0.21.0...sspi-v0.21.1)] - 2026-06-26
+
+### <!-- 1 -->Features
+
+- Add support for SECPKG_ATTR_NAMES ([#676](https://github.com/Devolutions/sspi-rs/issues/676)) ([be6315d475](https://github.com/Devolutions/sspi-rs/commit/be6315d475d7c4ce4c571220e2cfd7cb0881b7c7)) 
+
+- Add keytab client credentials and standards-compliant SASL/GSSAPI acceptor support ([#681](https://github.com/Devolutions/sspi-rs/issues/681)) ([d95f249622](https://github.com/Devolutions/sspi-rs/commit/d95f2496226d45fd4d02437c0c84afe870d9f510)) 
+
+  Extends the `sspi` Kerberos implementation to interoperate with standards-compliant SASL/GSSAPI (RFC 4752 / RFC 4121) peers by adding keytab-backed client credentials, supporting integrity-only (unsealed) `GSS_Wrap` tokens, and allowing acceptors to validate tickets for multiple configured service principals.
+
+- Support for Kerberos cross realm referral ([#694](https://github.com/Devolutions/sspi-rs/issues/694)) ([797365417f](https://github.com/Devolutions/sspi-rs/commit/797365417f6f75ee175eb0f8eb01d0c0b907d01f)) 
+
+### <!-- 4 -->Bug Fixes
+
+- Ntlm: NTLM_SSP_NEGOTIATE_KEY_EXCH flag usage ([#670](https://github.com/Devolutions/sspi-rs/issues/670)) ([a26a3692b0](https://github.com/Devolutions/sspi-rs/commit/a26a3692b029c5617f75a6dc618e5c7f78d3bc1b)) 
+
+- Package list handling ([#677](https://github.com/Devolutions/sspi-rs/issues/677)) ([ee75161bcd](https://github.com/Devolutions/sspi-rs/commit/ee75161bcdce0998b9173701129c0c7d607e1f17)) 
+
+- Disable `mechListMIC` for NTLM guest logon in negotiate module ([#680](https://github.com/Devolutions/sspi-rs/issues/680)) ([80bdedf387](https://github.com/Devolutions/sspi-rs/commit/80bdedf387da7341b95ff947d3bf68f48a0bc404)) 
+
+- Read channel bindings on the client authenticate step ([#695](https://github.com/Devolutions/sspi-rs/issues/695)) ([82741f6630](https://github.com/Devolutions/sspi-rs/commit/82741f6630c9b6038064caf8f508ac50e9f59738)) 
+
+### <!-- 7 -->Build
+
+- Advance RustCrypto pins to the current rc.18/rc.33/rc.10 cluster ([#692](https://github.com/Devolutions/sspi-rs/issues/692)) ([095e3f341c](https://github.com/Devolutions/sspi-rs/commit/095e3f341c74d57daafb015bfb0226188e9e8e18)) 
+
+- Update RC and crypto dependencies to latest versions ([#699](https://github.com/Devolutions/sspi-rs/issues/699)) ([c5922db0f4](https://github.com/Devolutions/sspi-rs/commit/c5922db0f4921323856a041c5e2987e569e62056)) 
+
 ## [[0.21.0](https://github.com/Devolutions/sspi-rs/compare/sspi-v0.20.1...sspi-v0.21.0)] - 2026-05-06
 
 ### <!-- 4 -->Bug Fixes

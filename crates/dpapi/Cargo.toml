@@ -17,38 +17,38 @@ name = "dpapi"
 tsssp = ["sspi/tsssp"]
 
 [dependencies]
-bitflags.workspace = true
-byteorder.workspace = true
-num-derive.workspace = true
-num-traits = { workspace = true, default-features = true }
-uuid = { workspace = true, features = ["std"] }
-picky-asn1.workspace = true
-picky-asn1-der.workspace = true
-picky-krb.workspace = true
-picky-asn1-x509 = { workspace = true, features = ["pkcs7"] }
-sha1.workspace = true
-sha2.workspace = true
-rand.workspace = true
-rand_core.workspace = true
-hmac.workspace = true
+bitflags = "2.11"
+byteorder = "1.5"
+num-derive = "0.5"
+num-traits = { version = "0.2", default-features = true }
+uuid = { version = "1.23", default-features = false, features = ["std"] }
+picky-asn1 = "0.10"
+picky-asn1-der = "0.5"
+picky-krb = "0.13"
+picky-asn1-x509 = { version = "0.15", features = ["pkcs7"] }
+sha1 = { version = "0.11", default-features = false }
+sha2 = "0.11"
+rand = "0.10"
+rand_core = "0.10"
+hmac = "0.13"
 digest = "0.11"
-tracing = { workspace = true, default-features = true }
-whoami.workspace = true
+tracing = { version = "0.1", default-features = true }
+whoami = "2.1"
 
 dpapi-core = { workspace = true, features = ["alloc"] }
 dpapi-pdu.workspace = true
 dpapi-transport.workspace = true
-sspi = { path = "../..", version = "0.21" } # public
+sspi = { package = "krabka-sspi", path = "../..", version = "0.23" } # public
 
 kbkdf = "=0.1.0-rc.1"
-elliptic-curve = { version = "=0.14.0-rc.31", features = ["sec1", "std"] }
-p521 = { version = "=0.14.0-rc.9", features = ["ecdh"] }
-p256 = { version = "=0.14.0-rc.9", features = ["ecdh"] }
-p384 = { version = "=0.14.0-rc.9", features = ["ecdh"] }
+elliptic-curve = { version = "0.14.0", features = ["sec1", "std"] }
+p521 = { version = "0.14", features = ["ecdh"] }
+p256 = { version = "0.14", features = ["ecdh"] }
+p384 = { version = "0.14", features = ["ecdh"] }
 concat-kdf = { git = "https://github.com/RustCrypto/KDFs.git", rev = "f2f5c03" } # TODO: We need the new version, but it's not released yet.
-typenum = "1.18"
+typenum = "1.20"
 aes-kw = "0.3"
-aes-gcm = { version = "=0.11.0-rc.4", features = ["getrandom"] }
+aes-gcm = { version = "=0.11.1", features = ["getrandom"] }
 url = "2.5"
 
 thiserror = "2.0"
@@ -58,25 +58,8 @@ getrandom = "0.4"
 
 # Pin transitive dependencies
 # TODO: Remove when stable versions will be released
-pkcs8 = "=0.11.0-rc.11"
-signature = "=3.0.0-rc.10"
-ecdsa = "=0.17.0-rc.17"
-rfc6979 = "=0.5.0-rc.5"
-aead = "=0.6.0-rc.10"
-ed25519 = "=3.0.0-rc.4"
-pbkdf2 = "=0.13.0-rc.10"
 pkcs1 = "=0.8.0-rc.4"
-rsa = { version = "=0.10.0-rc.17", default-features = false }
-ff = { version = "=0.14.0-pre.0", default-features = false }
-group = "=0.14.0-pre.0"
-rustcrypto-ff = "=0.14.0-rc.1"
-rustcrypto-ff_derive = "=0.14.0-rc.0"
-rustcrypto-group = "=0.14.0-rc.1"
-primefield = "=0.14.0-rc.9"
-primeorder = "=0.14.0-rc.9"
-ed25519-dalek = "=3.0.0-pre.6"
-curve25519-dalek = "=5.0.0-pre.6"
-x25519-dalek = "=3.0.0-pre.6"
+rsa = { version = "=0.10.0-rc.18", default-features = false }
 
 [dev-dependencies]
 paste = "1.0"

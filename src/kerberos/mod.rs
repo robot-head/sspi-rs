@@ -7,19 +7,21 @@ mod pa_datas;
 pub mod server;
 #[cfg(test)]
 mod tests;
-mod utils;
+pub(crate) mod utils;
 
 use std::fmt::Debug;
 use std::sync::LazyLock;
 
 use picky_asn1::restricted_string::IA5String;
 use picky_asn1::wrapper::{ExplicitContextTag0, ExplicitContextTag1, OctetStringAsn1, Optional};
+use picky_krb::crypto::aes::{AesSize, checksum_sha_aes};
 use picky_krb::crypto::{CipherSuite, DecryptWithoutChecksum, EncryptWithoutChecksum};
 use picky_krb::data_types::KerberosStringAsn1;
 use picky_krb::gss_api::WrapToken;
 use picky_krb::messages::KdcProxyMessage;
 use rand::rngs::{StdRng, SysRng};
 use rand_core::{Rng as _, SeedableRng as _};
+use time::{Duration, OffsetDateTime};
 use url::Url;
 
 pub use self::client::initialize_security_context;
@@ -56,12 +58,12 @@ pub const DEFAULT_ENCRYPTION_TYPE: CipherSuite = CipherSuite::Aes256CtsHmacSha19
 /// The RRC field is 12 if no encryption is requested or 28 if encryption is requested
 pub const RRC: u16 = 28;
 // wrap token header len
-pub const MAX_SIGNATURE: usize = 16;
+pub const MAX_SIGNATURE: u8 = 16;
 /// Required `TOKEN` buffer length during data encryption (`encrypt_message` method call).
 ///
 /// **Note**: Actual security trailer len is `SECURITY_TRAILER` + `EC`. The `EC` field is negotiated
 // during the authentication process.
-pub const SECURITY_TRAILER: usize = 60;
+pub const SECURITY_TRAILER: u8 = 60;
 
 /// [3.4.5.4.1 Kerberos Binding of GSS_WrapEx()](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-kile/e94b3acd-8415-4d0d-9786-749d0c39d550)
 ///
@@ -98,6 +100,9 @@ pub struct Kerberos {
     pub(crate) dh_parameters: Option<DhParameters>,
     pub(crate) krb5_user_to_user: bool,
     pub(crate) server: Option<Box<ServerProperties>>,
+    pub(crate) remote_seq_number: u32,
+    /// KDC time minus local time, learned from a clock-skew error during AS pre-authentication.
+    pub(crate) clock_offset: Duration,
 }
 
 impl Kerberos {
@@ -118,6 +123,8 @@ impl Kerberos {
             dh_parameters: None,
             krb5_user_to_user: false,
             server: None,
+            remote_seq_number: 0,
+            clock_offset: Duration::ZERO,
         })
     }
 
@@ -138,11 +145,19 @@ impl Kerberos {
             dh_parameters: None,
             krb5_user_to_user: false,
             server: Some(Box::new(server_properties)),
+            remote_seq_number: 0,
+            clock_offset: Duration::ZERO,
         })
     }
 
     pub fn is_client(&self) -> bool {
         self.server.is_none()
+    }
+
+    pub(crate) fn current_kdc_time(&self) -> Result<OffsetDateTime> {
+        OffsetDateTime::now_utc()
+            .checked_add(self.clock_offset)
+            .ok_or_else(|| Error::new(ErrorKind::TimeSkew, "KDC clock offset is out of range"))
     }
 
     pub fn config(&self) -> &KerberosConfig {
@@ -166,65 +181,97 @@ impl Kerberos {
     }
 
     async fn send(&self, yield_point: &mut YieldPointLocal, data: &[u8]) -> Result<Vec<u8>> {
-        if let Some((realm, kdc_url)) = self.get_kdc() {
-            let protocol = NetworkProtocol::from_url_scheme(kdc_url.scheme()).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidParameter,
-                    format!("Invalid protocol `{}` for KDC server", kdc_url.scheme()),
-                )
-            })?;
+        let (realm, kdc_url) = self
+            .get_kdc()
+            .ok_or_else(|| Error::new(ErrorKind::NoAuthenticatingAuthority, "No KDC server found"))?;
+        self.send_to(yield_point, &realm, kdc_url, data).await
+    }
 
-            return match protocol {
-                NetworkProtocol::Tcp => {
-                    let request = NetworkRequest {
-                        protocol,
-                        url: kdc_url.clone(),
-                        data: data.to_vec(),
-                    };
-                    yield_point.suspend(request).await
-                }
-                NetworkProtocol::Udp => {
-                    if data.len() < 4 {
-                        return Err(Error::new(
-                            ErrorKind::InternalError,
-                            format!(
-                                "kerberos message has invalid length. expected >= 4 but got {}",
-                                data.len()
-                            ),
-                        ));
-                    }
-
-                    // First 4 bytes are message length and it’s not included when using UDP
-                    let request = NetworkRequest {
-                        protocol,
-                        url: kdc_url.clone(),
-                        data: data[4..].to_vec(),
-                    };
-                    yield_point.suspend(request).await
-                }
-                NetworkProtocol::Http | NetworkProtocol::Https => {
-                    let data = OctetStringAsn1::from(data.to_vec());
-                    let domain = KerberosStringAsn1::from(IA5String::from_string(realm)?);
-
-                    let kdc_proxy_message = KdcProxyMessage {
-                        kerb_message: ExplicitContextTag0::from(data),
-                        target_domain: Optional::from(Some(ExplicitContextTag1::from(domain))),
-                        dclocator_hint: Optional::from(None),
-                    };
-
-                    let message_request = picky_asn1_der::to_vec(&kdc_proxy_message)?;
-                    let request = NetworkRequest {
-                        protocol,
-                        url: kdc_url,
-                        data: message_request,
-                    };
-                    let result_bytes = yield_point.suspend(request).await?;
-                    let message_response: KdcProxyMessage = picky_asn1_der::from_bytes(&result_bytes)?;
-                    Ok(message_response.kerb_message.0.0)
-                }
-            };
+    /// Sends a Kerberos message to the KDC responsible for `realm`.
+    ///
+    /// The pinned `kdc_url` (e.g. from KDC proxy settings) is authoritative only for the client's
+    /// home realm. For cross-realm referrals, the target realm's KDC is resolved via
+    /// [`detect_kdc_url`], so that `SSPI_KDC_URL_<REALM>` environment overrides (and the system
+    /// krb5.conf / DNS SRV records) are honored for the referral hop. This lets a single auth
+    /// chase a referral into a child/trusted realm without changing the pinned home-realm KDC.
+    async fn send_for_realm(&self, yield_point: &mut YieldPointLocal, realm: &str, data: &[u8]) -> Result<Vec<u8>> {
+        let kdc_url = if self.realm.as_deref() == Some(realm) {
+            self.kdc_url.clone().or_else(|| detect_kdc_url(realm))
+        } else {
+            detect_kdc_url(realm)
         }
-        Err(Error::new(ErrorKind::NoAuthenticatingAuthority, "No KDC server found"))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::NoAuthenticatingAuthority,
+                format!("No KDC server found for realm `{realm}`"),
+            )
+        })?;
+        self.send_to(yield_point, realm, kdc_url, data).await
+    }
+
+    async fn send_to(
+        &self,
+        yield_point: &mut YieldPointLocal,
+        realm: &str,
+        kdc_url: Url,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let protocol = NetworkProtocol::from_url_scheme(kdc_url.scheme()).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidParameter,
+                format!("Invalid protocol `{}` for KDC server", kdc_url.scheme()),
+            )
+        })?;
+
+        match protocol {
+            NetworkProtocol::Tcp => {
+                let request = NetworkRequest {
+                    protocol,
+                    url: kdc_url,
+                    data: data.to_vec(),
+                };
+                yield_point.suspend(request).await
+            }
+            NetworkProtocol::Udp => {
+                // First 4 bytes are message length and it’s not included when using UDP
+                let Some(data) = data.get(4..) else {
+                    return Err(Error::new(
+                        ErrorKind::InternalError,
+                        format!(
+                            "kerberos message has invalid length. expected >= 4 but got {}",
+                            data.len()
+                        ),
+                    ));
+                };
+
+                let request = NetworkRequest {
+                    protocol,
+                    url: kdc_url,
+                    data: data.to_vec(),
+                };
+                yield_point.suspend(request).await
+            }
+            NetworkProtocol::Http | NetworkProtocol::Https => {
+                let data = OctetStringAsn1::from(data.to_vec());
+                let domain = KerberosStringAsn1::from(IA5String::from_string(realm.to_owned())?);
+
+                let kdc_proxy_message = KdcProxyMessage {
+                    kerb_message: ExplicitContextTag0::from(data),
+                    target_domain: Optional::from(Some(ExplicitContextTag1::from(domain))),
+                    dclocator_hint: Optional::from(None),
+                };
+
+                let message_request = picky_asn1_der::to_vec(&kdc_proxy_message)?;
+                let request = NetworkRequest {
+                    protocol,
+                    url: kdc_url,
+                    data: message_request,
+                };
+                let result_bytes = yield_point.suspend(request).await?;
+                let message_response: KdcProxyMessage = picky_asn1_der::from_bytes(&result_bytes)?;
+                Ok(message_response.kerb_message.0.0)
+            }
+        }
     }
 }
 
@@ -268,7 +315,7 @@ impl Sspi for Kerberos {
 
         let key_usage = self.encryption_params.sspi_encrypt_key_usage;
 
-        let mut wrap_token = WrapToken::with_seq_number(seq_number as u64);
+        let mut wrap_token = WrapToken::with_seq_number(seq_number.into());
         if self.server.is_some() {
             // [Flags Field](https://datatracker.ietf.org/doc/html/rfc4121#section-4.2.2):
             //
@@ -335,7 +382,8 @@ impl Sspi for Kerberos {
         let security_trailer_len = self.query_context_sizes()?.security_trailer.try_into()?;
 
         let (token, data) = if raw_wrap_token.len() < security_trailer_len {
-            (raw_wrap_token.as_slice(), &[] as &[u8])
+            let empty_data: &[u8] = &[];
+            (raw_wrap_token.as_slice(), empty_data)
         } else {
             raw_wrap_token.split_at(security_trailer_len)
         };
@@ -399,11 +447,26 @@ impl Sspi for Kerberos {
         //        1   Sealed           When set in Wrap tokens, this flag
         //                             indicates confidentiality is provided
         //                             for.  It SHALL NOT be set in MIC tokens.
+        //
+        // When the Sealed flag is clear, this is an integrity-only Wrap token
+        // (GSS_Wrap with conf_req_flag == FALSE, RFC 4121 §4.2.4): the data is
+        // carried in cleartext followed by the checksum, rather than encrypted.
+        // Stock SASL/GSSAPI clients (e.g. Java/Kafka) use conf=false for the
+        // RFC 4752 security-layer negotiation reply, so the acceptor must
+        // accept it instead of demanding confidentiality.
         if wrap_token.flags & 0b10 != 0b10 {
-            return Err(Error::new(
-                ErrorKind::InvalidToken,
-                "the Sealed flag has to be set in WRAP token",
-            ));
+            // The integrity-only checksum is the AES-SHA1 keyed HMAC
+            // (`checksum_sha_aes`), which is only defined for the AES cipher
+            // suites. Reject non-AES contexts (e.g. `Des3CbcSha1Kd`) explicitly
+            // rather than silently treating them as AES-256, which would produce
+            // incorrect checksum validation.
+            let aes_size = self.encryption_params.aes_size().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::UnsupportedFunction,
+                    "integrity-only WRAP tokens are only supported for AES cipher suites",
+                )
+            })?;
+            return decrypt_integrity_only_wrap(&wrap_token, key.as_ref(), &aes_size, key_usage, message);
         }
 
         let mut checksum = wrap_token.checksum;
@@ -470,9 +533,9 @@ impl Sspi for Kerberos {
 
         Ok(ContextSizes {
             max_token: PACKAGE_INFO.max_token_len,
-            max_signature: MAX_SIGNATURE as u32,
+            max_signature: MAX_SIGNATURE.into(),
             block: 0,
-            security_trailer: SECURITY_TRAILER as u32 + u32::from(self.encryption_params.ec),
+            security_trailer: u32::from(SECURITY_TRAILER) + u32::from(self.encryption_params.ec),
         })
     }
 
@@ -550,6 +613,65 @@ impl Sspi for Kerberos {
             "verify_signature is not supported. use decrypt_message to verify signatures instead",
         ))
     }
+}
+
+/// Verifies an integrity-only (GSS_Wrap conf_req_flag == FALSE) Wrap token and
+/// returns its cleartext payload in the message buffers.
+///
+/// Per RFC 4121 §4.2.4, an unsealed Wrap token carries the data in the clear
+/// followed by the checksum: `{header | plaintext | checksum}`, right-rotated
+/// by RRC. The checksum is computed over `plaintext | header`, where the EC and
+/// RRC fields of the 16-octet header are zeroed for the computation. Wrap tokens
+/// — sealed or not — use the SEAL key usage (the SIGN usage is reserved for MIC
+/// tokens), so `key_usage` is the same value the sealed path uses. The checksum
+/// itself is the keyed get_mic checksum (Kc-derived), not the Ki-derived
+/// encryption integrity hash used for the confidential path.
+fn decrypt_integrity_only_wrap(
+    wrap_token: &WrapToken,
+    key: &[u8],
+    aes_size: &AesSize,
+    key_usage: i32,
+    message: &mut [SecurityBufferRef<'_>],
+) -> Result<DecryptionFlags> {
+    // `WrapToken::decode` stores everything after the 16-octet header in
+    // `checksum`; for an unsealed token that is `plaintext | trailing-checksum`.
+    let mut data = wrap_token.checksum.clone();
+    if data.is_empty() {
+        return Err(Error::new(ErrorKind::DecryptFailure, "empty integrity-only WRAP token"));
+    }
+
+    // Undo the sender's right rotation. For integrity-only tokens the rotation
+    // is by RRC alone (the EC octets are checksum, not filler).
+    let rotate = usize::from(wrap_token.rrc) % data.len();
+    data.rotate_left(rotate);
+
+    let ec = usize::from(wrap_token.ec);
+    if data.len() < ec {
+        return Err(Error::new(
+            ErrorKind::DecryptFailure,
+            "integrity-only WRAP token shorter than its checksum",
+        ));
+    }
+    let plaintext_len = data.len() - ec;
+    let (plaintext, received_checksum) = data.split_at(plaintext_len);
+
+    // Checksum input: plaintext followed by the 16-octet header with the EC and
+    // RRC fields zeroed (RFC 4121 §4.2.4).
+    let mut header = wrap_token.header();
+    header[4..8].copy_from_slice(&[0, 0, 0, 0]);
+
+    let mut to_sign = plaintext.to_vec();
+    to_sign.extend_from_slice(&header);
+
+    let calculated = checksum_sha_aes(key, key_usage, &to_sign, aes_size)?;
+
+    if calculated.as_slice() != received_checksum {
+        return Err(picky_krb::crypto::KerberosCryptoError::IntegrityCheck.into());
+    }
+
+    save_decrypted_data(plaintext, message)?;
+
+    Ok(DecryptionFlags::empty())
 }
 
 impl SspiImpl for Kerberos {
@@ -645,7 +767,13 @@ impl SspiEx for Kerberos {
     }
 
     fn verify_mic_token(&mut self, token: &[u8], data: &[u8], _: crate::private::Sealed) -> Result<()> {
-        utils::validate_mic_token(self.is_client(), token, &self.encryption_params, data)
+        utils::validate_mic_token(
+            self.is_client(),
+            self.remote_seq_number.into(),
+            token,
+            &self.encryption_params,
+            data,
+        )
     }
 
     fn generate_mic_token(&mut self, data: &[u8], _: crate::private::Sealed) -> Result<Vec<u8>> {
@@ -661,7 +789,18 @@ impl SspiEx for Kerberos {
             .sub_session_key
             .as_ref()
             .ok_or_else(|| Error::new(ErrorKind::InternalError, "kerberos sub-session key is not set"))?;
-        utils::generate_mic_token(self.is_client(), u64::from(seq_number), data.to_vec(), session_key)
+        let aes_size = self
+            .encryption_params
+            .active_key_aes_size()
+            .or_else(|| self.encryption_params.aes_size())
+            .unwrap_or(AesSize::Aes256);
+        utils::generate_mic_token(
+            self.is_client(),
+            u64::from(seq_number),
+            data.to_vec(),
+            session_key,
+            &aes_size,
+        )
     }
 }
 
@@ -718,6 +857,8 @@ pub mod test_data {
             dh_parameters: None,
             krb5_user_to_user: false,
             server: None,
+            remote_seq_number: 0,
+            clock_offset: time::Duration::ZERO,
         }
     }
 
@@ -733,6 +874,7 @@ pub mod test_data {
                     KerberosStringAsn1::from(IA5String::from_string("VM1.example.com".to_owned()).unwrap()),
                 ])),
             },
+            additional_service_keys: Vec::new(),
             user: None,
             client: None,
             authenticators_cache: Default::default(),
@@ -763,6 +905,8 @@ pub mod test_data {
             dh_parameters: None,
             krb5_user_to_user: false,
             server: Some(Box::new(fake_server_properties())),
+            remote_seq_number: 0,
+            clock_offset: time::Duration::ZERO,
         }
     }
 }

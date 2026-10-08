@@ -105,7 +105,8 @@ use utils::map_keb_error_code_to_sspi_error;
 pub use utils::modpow;
 
 pub use self::auth_identity::{
-    AuthIdentity, AuthIdentityBuffers, Credentials, CredentialsBuffers, UserNameFormat, Username,
+    AuthIdentity, AuthIdentityBuffers, Credentials, CredentialsBuffers, DownLevelLogonNameParts, KeytabIdentity,
+    UserNameFormat, UserPrincipalNameParts, Username, UsernameParts,
 };
 #[cfg(feature = "scard")]
 pub use self::auth_identity::{CertificateRaw, SmartCardIdentity, SmartCardIdentityBuffers, SmartCardType};
@@ -123,8 +124,8 @@ pub use self::negotiate::client::FALLBACK_ERROR_KINDS;
 pub use self::negotiate::{Negotiate, NegotiateConfig, NegotiatedProtocol};
 pub use self::ntlm::Ntlm;
 pub use self::ntlm::hash::{NTLM_HASH_PREFIX, NtlmHash, NtlmHashError};
-pub use self::pku2u::{Pku2u, Pku2uConfig, Pku2uState};
-pub use self::secret::Secret;
+pub use self::pku2u::{Pku2u, Pku2uConfig, Pku2uCredential, Pku2uPrivateKey, Pku2uState};
+pub use self::secret::{Secret, SecretPrivateKey};
 use crate::builders::{
     EmptyAcceptSecurityContext, EmptyAcquireCredentialsHandle, EmptyInitializeSecurityContext,
     InitializeSecurityContext,
@@ -1010,7 +1011,7 @@ where
     ///
     /// let names = ntlm.query_context_names().unwrap();
     /// println!("Username: {:?}", names.username.account_name());
-    /// println!("Domain: {:?}", names.username.domain_name());
+    /// println!("Parts: {:?}", names.username.parts());
     /// ```
     ///
     /// # MSDN
@@ -2187,6 +2188,15 @@ pub enum ErrorKind {
     ApplicationProtocolMismatch = 0x8009_0367,
 }
 
+impl From<ErrorKind> for u32 {
+    fn from(value: ErrorKind) -> u32 {
+        #[expect(clippy::as_conversions, reason = "enum repr cast in From impl")]
+        {
+            value as u32
+        }
+    }
+}
+
 /// Holds the `ErrorKind` and the description of the SSPI-related error.
 #[derive(Debug, Clone)]
 pub struct Error {
@@ -2358,6 +2368,7 @@ impl From<GssApiMessageError> for Error {
             GssApiMessageError::InvalidMicFiller(_) => Self::new(ErrorKind::InvalidToken, err.to_string()),
             GssApiMessageError::InvalidWrapFiller(_) => Self::new(ErrorKind::InvalidToken, err.to_string()),
             GssApiMessageError::Asn1Error(_) => Self::new(ErrorKind::InvalidToken, err.to_string()),
+            GssApiMessageError::InvalidMechanismOid(_, _) => Self::new(ErrorKind::InvalidToken, err.to_string()),
         }
     }
 }

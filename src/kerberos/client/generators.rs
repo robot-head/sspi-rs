@@ -1,5 +1,3 @@
-use std::env;
-use std::path::Path;
 use std::str::FromStr;
 
 use bitflags;
@@ -19,8 +17,8 @@ use picky_krb::constants::key_usages::{
 };
 use picky_krb::constants::types::{
     AD_AUTH_DATA_AP_OPTION_TYPE, AP_REP_MSG_TYPE, AP_REQ_MSG_TYPE, AS_REQ_MSG_TYPE, KERB_AP_OPTIONS_CBT, KRB_PRIV,
-    NET_BIOS_ADDR_TYPE, NT_ENTERPRISE, NT_PRINCIPAL, NT_SRV_INST, PA_ENC_TIMESTAMP, PA_ENC_TIMESTAMP_KEY_USAGE,
-    PA_PAC_OPTIONS_TYPE, PA_PAC_REQUEST_TYPE, PA_TGS_REQ_TYPE, TGS_REQ_MSG_TYPE, TGT_REQ_MSG_TYPE,
+    NET_BIOS_ADDR_TYPE, NT_SRV_INST, PA_ENC_TIMESTAMP, PA_ENC_TIMESTAMP_KEY_USAGE, PA_PAC_OPTIONS_TYPE,
+    PA_PAC_REQUEST_TYPE, PA_TGS_REQ_TYPE, TGS_REQ_MSG_TYPE, TGT_REQ_MSG_TYPE,
 };
 use picky_krb::crypto::CipherSuite;
 use picky_krb::data_types::{
@@ -35,19 +33,43 @@ use picky_krb::messages::{
     KrbPrivMessage, TgsReq, TgtReq,
 };
 use rand::rngs::{StdRng, SysRng};
-use rand_core::{Rng as _, SeedableRng as _};
+use rand_core::{Rng, SeedableRng as _};
 use time::{Duration, OffsetDateTime};
 
 use crate::channel_bindings::ChannelBindings;
 use crate::crypto::compute_md5_channel_bindings_hash;
 use crate::kerberos::flags::{ApOptions as ApOptionsFlags, KdcOptions};
 use crate::kerberos::{DEFAULT_ENCRYPTION_TYPE, EncryptionParams, KERBEROS_VERSION};
-use crate::krb::Krb5Conf;
 use crate::utils::parse_target_name;
 use crate::{ClientRequestFlags, Error, ErrorKind, Result, Secret};
 
+/// Moved to [`super::principal::get_client_principal_name_type`].
+#[allow(
+    clippy::deprecated_semver,
+    reason = "`<next-version>` placeholder filled in at release time"
+)]
+#[deprecated(
+    since = "<next-version>",
+    note = "moved to the `kerberos::client::principal` module — see https://github.com/Devolutions/sspi-rs/issues/708"
+)]
+pub fn get_client_principal_name_type(username: &str, domain: &str) -> u8 {
+    super::principal::get_client_principal_name_type(username, domain)
+}
+
+/// Moved to [`super::principal::get_client_principal_realm`].
+#[allow(
+    clippy::deprecated_semver,
+    reason = "`<next-version>` placeholder filled in at release time"
+)]
+#[deprecated(
+    since = "<next-version>",
+    note = "moved to the `kerberos::client::principal` module — see https://github.com/Devolutions/sspi-rs/issues/708"
+)]
+pub fn get_client_principal_realm(username: &str, domain: &str) -> String {
+    super::principal::get_client_principal_realm(username, domain)
+}
+
 const TGT_TICKET_LIFETIME_DAYS: i64 = 3;
-const NONCE_LEN: usize = 4;
 /// [Microseconds](https://www.rfc-editor.org/rfc/rfc4120#section-5.2.4).
 /// The maximum microseconds value.
 ///
@@ -75,83 +97,6 @@ pub const AUTHENTICATOR_DEFAULT_CHECKSUM: [u8; 24] = [
     0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00,
 ];
-
-/// [MS-KILE] 3.3.5.6.1 Client Principal Lookup
-/// https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-kile/6435d3fb-8cf6-4df5-a156-1277690ed59c
-pub fn get_client_principal_name_type(username: &str, _domain: &str) -> u8 {
-    if username.contains('@') {
-        NT_ENTERPRISE
-    } else {
-        NT_PRINCIPAL
-    }
-}
-
-pub fn get_client_principal_realm(username: &str, domain: &str) -> String {
-    // https://web.mit.edu/kerberos/krb5-current/doc/user/user_config/kerberos.html#environment-variables
-
-    let krb5_config = env::var("KRB5_CONFIG").unwrap_or_else(|_| "/etc/krb5.conf:/usr/local/etc/krb5.conf".to_string());
-    let krb5_conf_paths = krb5_config.split(':').map(Path::new).collect::<Vec<&Path>>();
-
-    get_client_principal_realm_impl(&krb5_conf_paths, username, domain)
-}
-
-fn get_client_principal_realm_impl(krb5_conf_paths: &[&Path], username: &str, domain: &str) -> String {
-    let domain = if domain.is_empty() {
-        if let Some((_left, right)) = username.split_once('@') {
-            right.to_string()
-        } else {
-            String::new()
-        }
-    } else {
-        domain.to_string()
-    };
-
-    for krb5_conf_path in krb5_conf_paths {
-        if !krb5_conf_path.exists() {
-            continue;
-        }
-
-        if let Some(krb5_conf) = Krb5Conf::new_from_file(krb5_conf_path)
-            && let Some(mappings) = krb5_conf.get_values_in_section(&["domain_realm"])
-        {
-            for (mapping_domain, realm) in mappings {
-                if matches_domain(&domain, mapping_domain) {
-                    return realm.to_owned();
-                }
-            }
-        }
-    }
-
-    domain.to_uppercase()
-}
-
-/// Checks if the given domain matches the mapping domain (usually from krb5.conf file).
-///
-/// # Mapping rules
-///
-/// We follow the MIT KRB5 behavior: https://github.com/krb5/krb5/commit/8f5ce824012f2caab6770df464f096c38dc4cb2e.
-///
-/// - If the mapping domain starts with a dot (e.g., `.example.com`),
-///   it matches all hosts under the domain, but not the host with the name `example.com`.
-///   For example, "test.example.com" or "d1.example.com" will match `.example.com`, but `example.com` will not.
-/// - If the mapping domain does not start with a dot (e.g., `example.com`),
-///   it matches all hosts under the domain `example.com` (including `example.com`).
-///
-/// So, the mappings order in `krb5.conf` matters.
-fn matches_domain(domain: &str, mapping_domain: &str) -> bool {
-    let domain = domain.to_lowercase();
-    let mapping_domain = mapping_domain.to_lowercase();
-
-    if mapping_domain.starts_with('.') {
-        // If mapping_domain starts with a dot, it matches subdomains only
-        // e.g., `.example.com` matches `test.example.com` but not `example.com`
-        domain.ends_with(&mapping_domain)
-    } else {
-        // If mapping_domain doesn't start with a dot, it matches the domain itself
-        // and all subdomains (e.g., `example.com` matches `example.com` and `test.example.com`).
-        domain == mapping_domain || domain.ends_with(&format!(".{mapping_domain}"))
-    }
-}
 
 pub(super) fn generate_tgt_req(sname: &[&str]) -> Result<TgtReq> {
     let sname = sname
@@ -182,8 +127,66 @@ pub struct GenerateAsPaDataOptions<'a> {
     pub with_pre_auth: bool,
 }
 
+/// Build the PA-ENC-TIMESTAMP pre-auth value, encrypting the current time with
+/// an already-derived long-term `key` of type `encryption_type`.
+fn encode_enc_timestamp_pa_data(
+    key: &[u8],
+    encryption_type: &CipherSuite,
+    current_date: OffsetDateTime,
+) -> Result<PaData> {
+    let cipher = encryption_type.cipher();
+
+    let microseconds = current_date.microsecond().min(MAX_MICROSECONDS);
+
+    let timestamp = PaEncTsEnc {
+        patimestamp: ExplicitContextTag0::from(KerberosTime::from(GeneralizedTime::from(current_date))),
+        pausec: Optional::from(Some(ExplicitContextTag1::from(IntegerAsn1::from(
+            microseconds.to_be_bytes().to_vec(),
+        )))),
+    };
+    let timestamp_bytes = picky_asn1_der::to_vec(&timestamp)?;
+
+    trace!(?encryption_type, "AS timestamp encryption params",);
+
+    let encrypted_timestamp = cipher.encrypt(key, PA_ENC_TIMESTAMP_KEY_USAGE, &timestamp_bytes)?;
+
+    trace!(
+        ?current_date,
+        ?microseconds,
+        ?timestamp_bytes,
+        ?encrypted_timestamp,
+        "Encrypted timestamp params",
+    );
+
+    Ok(PaData {
+        padata_type: ExplicitContextTag1::from(IntegerAsn1::from(PA_ENC_TIMESTAMP.to_vec())),
+        padata_data: ExplicitContextTag2::from(OctetStringAsn1::from(picky_asn1_der::to_vec(&EncryptedData {
+            etype: ExplicitContextTag0::from(IntegerAsn1::from(vec![encryption_type.into()])),
+            kvno: Optional::from(None),
+            cipher: ExplicitContextTag2::from(OctetStringAsn1::from(encrypted_timestamp)),
+        })?)),
+    })
+}
+
+/// Build the PA-PAC-REQUEST pre-auth value (always requests a PAC).
+fn encode_pac_request_pa_data() -> Result<PaData> {
+    Ok(PaData {
+        padata_type: ExplicitContextTag1::from(IntegerAsn1::from(PA_PAC_REQUEST_TYPE.to_vec())),
+        padata_data: ExplicitContextTag2::from(OctetStringAsn1::from(picky_asn1_der::to_vec(&KerbPaPacRequest {
+            include_pac: ExplicitContextTag0::from(true),
+        })?)),
+    })
+}
+
 #[instrument(level = "trace", ret, skip_all, fields(options.salt, options.enc_params, options.with_pre_auth))]
 pub fn generate_pa_datas_for_as_req(options: &GenerateAsPaDataOptions<'_>) -> Result<Vec<PaData>> {
+    generate_pa_datas_for_as_req_at(options, OffsetDateTime::now_utc())
+}
+
+pub(crate) fn generate_pa_datas_for_as_req_at(
+    options: &GenerateAsPaDataOptions<'_>,
+    timestamp: OffsetDateTime,
+) -> Result<Vec<PaData>> {
     let GenerateAsPaDataOptions {
         password,
         salt,
@@ -191,54 +194,77 @@ pub fn generate_pa_datas_for_as_req(options: &GenerateAsPaDataOptions<'_>) -> Re
         with_pre_auth,
     } = options;
 
-    let mut pa_datas = if *with_pre_auth {
-        let current_date = OffsetDateTime::now_utc();
-        let microseconds = current_date.microsecond().min(MAX_MICROSECONDS);
+    let mut pa_datas = Vec::new();
 
-        let timestamp = PaEncTsEnc {
-            patimestamp: ExplicitContextTag0::from(KerberosTime::from(GeneralizedTime::from(current_date))),
-            pausec: Optional::from(Some(ExplicitContextTag1::from(IntegerAsn1::from(
-                microseconds.to_be_bytes().to_vec(),
-            )))),
-        };
-        let timestamp_bytes = picky_asn1_der::to_vec(&timestamp)?;
-
+    if *with_pre_auth {
         let encryption_type = enc_params.encryption_type.as_ref().unwrap_or(&DEFAULT_ENCRYPTION_TYPE);
-        let cipher = encryption_type.cipher();
+        let key = encryption_type
+            .cipher()
+            .generate_key_from_password(password.as_bytes(), salt)?;
+        pa_datas.push(encode_enc_timestamp_pa_data(&key, encryption_type, timestamp)?);
+    }
 
-        let key = cipher.generate_key_from_password(password.as_bytes(), salt)?;
-        trace!(?key, ?encryption_type, "AS timestamp encryption params",);
-
-        let encrypted_timestamp = cipher.encrypt(&key, PA_ENC_TIMESTAMP_KEY_USAGE, &timestamp_bytes)?;
-
-        trace!(
-            ?current_date,
-            ?microseconds,
-            ?timestamp_bytes,
-            ?encrypted_timestamp,
-            "Encrypted timestamp params",
-        );
-
-        vec![PaData {
-            padata_type: ExplicitContextTag1::from(IntegerAsn1::from(PA_ENC_TIMESTAMP.to_vec())),
-            padata_data: ExplicitContextTag2::from(OctetStringAsn1::from(picky_asn1_der::to_vec(&EncryptedData {
-                etype: ExplicitContextTag0::from(IntegerAsn1::from(vec![encryption_type.into()])),
-                kvno: Optional::from(None),
-                cipher: ExplicitContextTag2::from(OctetStringAsn1::from(encrypted_timestamp)),
-            })?)),
-        }]
-    } else {
-        Vec::new()
-    };
-
-    pa_datas.push(PaData {
-        padata_type: ExplicitContextTag1::from(IntegerAsn1::from(PA_PAC_REQUEST_TYPE.to_vec())),
-        padata_data: ExplicitContextTag2::from(OctetStringAsn1::from(picky_asn1_der::to_vec(&KerbPaPacRequest {
-            include_pac: ExplicitContextTag0::from(true),
-        })?)),
-    });
+    pa_datas.push(encode_pac_request_pa_data()?);
 
     Ok(pa_datas)
+}
+
+/// Parameters for generating pa-datas for an [AsReq] using a pre-derived
+/// long-term key (keytab-based client authentication).
+#[derive(Debug)]
+pub struct GenerateKeytabPaDataOptions {
+    /// Raw long-term key bytes.
+    pub key: Secret<Vec<u8>>,
+    /// Kerberos encryption type of `key` (e.g. aes256-cts-hmac-sha1-96).
+    pub key_enctype: CipherSuite,
+    /// Flag that indicates whether to generate the PA-ENC-TIMESTAMP pa-data.
+    pub with_pre_auth: bool,
+}
+
+#[instrument(level = "trace", ret, skip_all, fields(options.key_enctype, options.with_pre_auth))]
+pub fn generate_pa_datas_for_as_req_with_key(options: &GenerateKeytabPaDataOptions) -> Result<Vec<PaData>> {
+    generate_pa_datas_for_as_req_with_key_at(options, OffsetDateTime::now_utc())
+}
+
+pub(crate) fn generate_pa_datas_for_as_req_with_key_at(
+    options: &GenerateKeytabPaDataOptions,
+    timestamp: OffsetDateTime,
+) -> Result<Vec<PaData>> {
+    let mut pa_datas = Vec::new();
+
+    if options.with_pre_auth {
+        pa_datas.push(encode_enc_timestamp_pa_data(
+            options.key.as_ref(),
+            &options.key_enctype,
+            timestamp,
+        )?);
+    }
+
+    pa_datas.push(encode_pac_request_pa_data()?);
+
+    Ok(pa_datas)
+}
+
+/// Generates a random KDC-REQ nonce in the positive `Int32` range.
+///
+/// Windows and MIT krb5 read the nonce as a signed `Int32`. Like MIT krb5 and Heimdal, the high bit
+/// is cleared so the value is the same whether a peer reads the nonce as signed or unsigned.
+pub(crate) fn generate_nonce(rng: &mut impl Rng) -> u32 {
+    rng.next_u32() & 0x7fff_ffff
+}
+
+/// Encodes a nonce as a minimal DER INTEGER in the `Int32` range.
+///
+/// The TGS-REQ authenticator checksum covers the DER encoded KDC-REQ-BODY and the Windows KDC
+/// verifies it against its own re-encoding of the body. A nonce that is not minimal DER makes the
+/// re-encoded body differ and the KDC fails the request with `KRB_AP_ERR_MODIFIED`.
+///
+/// The value is encoded as a signed `Int32`, the way Windows re-encodes the nonce. A nonce with the
+/// high bit set stays a 4-byte negative INTEGER, an unsigned encoding would add a fifth `00` octet
+/// and the Windows KDC rejects the request outright. Nonces from [generate_nonce] are positive and
+/// encode the same either way.
+pub(crate) fn nonce_to_asn1(nonce: u32) -> IntegerAsn1 {
+    IntegerAsn1::from_bytes_be_signed(nonce.to_be_bytes().to_vec())
 }
 
 /// Parameters for generating [AsReq].
@@ -248,7 +274,8 @@ pub struct GenerateAsReqOptions<'a> {
     pub username: &'a str,
     pub cname_type: u8,
     pub snames: &'a [&'a str],
-    pub nonce: &'a [u8],
+    /// KDC-REQ nonce, encoded with [nonce_to_asn1].
+    pub nonce: u32,
     pub hostname: &'a str,
     pub context_requirements: ClientRequestFlags,
 }
@@ -292,9 +319,15 @@ pub fn generate_as_req_kdc_body(options: &GenerateAsReqOptions<'_>) -> Result<Kd
         ))),
         cname: Optional::from(Some(ExplicitContextTag1::from(PrincipalName {
             name_type: ExplicitContextTag0::from(IntegerAsn1::from(vec![*cname_type])),
-            name_string: ExplicitContextTag1::from(Asn1SequenceOf::from(vec![KerberosStringAsn1::from(
-                IA5String::from_string((*username).into())?,
-            )])),
+            // A Kerberos principal name is a sequence of `/`-separated
+            // components (RFC 1964 §2.1.1). Service principals such as
+            // `kafka/host` carry two components; user principals carry one.
+            name_string: ExplicitContextTag1::from(Asn1SequenceOf::from(
+                username
+                    .split('/')
+                    .map(|c| Ok(KerberosStringAsn1::from(IA5String::from_string(c.to_owned())?)))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
         }))),
         realm: ExplicitContextTag2::from(Realm::from(IA5String::from_string((*realm).into())?)),
         sname: Optional::from(Some(ExplicitContextTag3::from(PrincipalName {
@@ -306,7 +339,7 @@ pub fn generate_as_req_kdc_body(options: &GenerateAsReqOptions<'_>) -> Result<Kd
         rtime: Optional::from(Some(ExplicitContextTag6::from(GeneralizedTimeAsn1::from(
             GeneralizedTime::from(expiration_date),
         )))),
-        nonce: ExplicitContextTag7::from(IntegerAsn1::from(nonce.to_vec())),
+        nonce: ExplicitContextTag7::from(nonce_to_asn1(*nonce)),
         etype: ExplicitContextTag8::from(Asn1SequenceOf::from(vec![
             IntegerAsn1::from(vec![CipherSuite::Aes256CtsHmacSha196.into()]),
             IntegerAsn1::from(vec![CipherSuite::Aes128CtsHmacSha196.into()]),
@@ -372,8 +405,7 @@ pub fn generate_tgs_req(options: GenerateTgsReqOptions<'_>) -> Result<TgsReq> {
     }
 
     let mut rng = StdRng::try_from_rng(&mut SysRng)?;
-    let mut nonce = [0; NONCE_LEN];
-    rng.fill_bytes(&mut nonce);
+    let nonce = generate_nonce(&mut rng);
 
     let req_body = KdcReqBody {
         kdc_options: ExplicitContextTag0::from(KerberosFlags::from(BitString::with_bytes(
@@ -391,7 +423,7 @@ pub fn generate_tgs_req(options: GenerateTgsReqOptions<'_>) -> Result<TgsReq> {
         from: Optional::from(None),
         till: ExplicitContextTag5::from(GeneralizedTimeAsn1::from(GeneralizedTime::from(expiration_date))),
         rtime: Optional::from(None),
-        nonce: ExplicitContextTag7::from(IntegerAsn1::from(nonce.to_vec())),
+        nonce: ExplicitContextTag7::from(nonce_to_asn1(nonce)),
         etype: ExplicitContextTag8::from(Asn1SequenceOf::from(vec![
             IntegerAsn1::from(vec![CipherSuite::Aes256CtsHmacSha196.into()]),
             IntegerAsn1::from(vec![CipherSuite::Aes128CtsHmacSha196.into()]),
@@ -560,6 +592,14 @@ impl From<ClientRequestFlags> for GssFlags {
             flags |= GssFlags::GSS_C_DCE_STYLE;
         }
 
+        if value.contains(ClientRequestFlags::EXTENDED_ERROR) {
+            flags |= GssFlags::GSS_C_EXTENDED_ERROR_FLAG;
+        }
+
+        if value.contains(ClientRequestFlags::IDENTIFY) {
+            flags |= GssFlags::GSS_C_IDENTIFY_FLAG;
+        }
+
         flags
     }
 }
@@ -599,6 +639,13 @@ pub struct GenerateAuthenticatorOptions<'a> {
 /// Generated ApReq Authenticator.
 #[instrument(level = "trace", ret)]
 pub fn generate_authenticator(options: GenerateAuthenticatorOptions<'_>) -> Result<Authenticator> {
+    generate_authenticator_at(options, OffsetDateTime::now_utc())
+}
+
+pub(crate) fn generate_authenticator_at(
+    options: GenerateAuthenticatorOptions<'_>,
+    current_date: OffsetDateTime,
+) -> Result<Authenticator> {
     let GenerateAuthenticatorOptions {
         kdc_rep,
         seq_num,
@@ -608,7 +655,6 @@ pub fn generate_authenticator(options: GenerateAuthenticatorOptions<'_>) -> Resu
         ..
     } = options;
 
-    let current_date = OffsetDateTime::now_utc();
     let mut microseconds = current_date.microsecond();
     if microseconds > MAX_MICROSECONDS {
         microseconds = MAX_MICROSECONDS;
@@ -630,7 +676,7 @@ pub fn generate_authenticator(options: GenerateAuthenticatorOptions<'_>) -> Resu
         if checksum_type == AUTHENTICATOR_CHECKSUM_TYPE
             && let Some(channel_bindings) = channel_bindings
         {
-            if checksum_value.len() < 20 {
+            let Some(channel_binding_buf) = checksum_value.get_mut(4..20) else {
                 return Err(Error::new(
                     ErrorKind::InvalidParameter,
                     format!(
@@ -638,10 +684,10 @@ pub fn generate_authenticator(options: GenerateAuthenticatorOptions<'_>) -> Resu
                         checksum_value.len()
                     ),
                 ));
-            }
+            };
             // [Authenticator Checksum](https://datatracker.ietf.org/doc/html/rfc4121#section-4.1.1)
             // 4..19 - Channel binding information (19 inclusive).
-            checksum_value[4..20].copy_from_slice(&compute_md5_channel_bindings_hash(channel_bindings));
+            channel_binding_buf.copy_from_slice(&compute_md5_channel_bindings_hash(channel_bindings)?);
         }
         Optional::from(Some(ExplicitContextTag3::from(Checksum {
             cksumtype: ExplicitContextTag0::from(IntegerAsn1::from(checksum_type)),
@@ -847,9 +893,64 @@ pub fn generate_krb_priv_request(
 
 #[cfg(test)]
 mod tests {
+    use picky_krb::constants::types::NT_PRINCIPAL;
+
     use super::*;
 
-    const KRB5_CONFIG_FILE_PATH: &str = "test_assets/krb5.conf";
+    #[test]
+    fn nonce_is_minimal_der() {
+        for (nonce, expected) in [
+            // Previously sent verbatim, the Windows KDC failed these with KRB_AP_ERR_MODIFIED.
+            (0x0009_a792, vec![0x02, 0x03, 0x09, 0xa7, 0x92]),
+            (0x0000_0001, vec![0x02, 0x01, 0x01]),
+            (0x0000_0000, vec![0x02, 0x01, 0x00]),
+            (0x7fa0_b3df, vec![0x02, 0x04, 0x7f, 0xa0, 0xb3, 0xdf]),
+            (0x1234_5678, vec![0x02, 0x04, 0x12, 0x34, 0x56, 0x78]),
+            // A high bit must not add a fifth `00` octet, the Windows KDC rejects a nonce outside the
+            // `Int32` range.
+            (0x9abc_def0, vec![0x02, 0x04, 0x9a, 0xbc, 0xde, 0xf0]),
+            (0x8000_0000, vec![0x02, 0x04, 0x80, 0x00, 0x00, 0x00]),
+            (0xffff_ffff, vec![0x02, 0x01, 0xff]),
+            // Non-minimal negative, previously failed with KRB_AP_ERR_MODIFIED.
+            (0xffa0_b3df, vec![0x02, 0x03, 0xa0, 0xb3, 0xdf]),
+        ] {
+            assert_eq!(picky_asn1_der::to_vec(&nonce_to_asn1(nonce)).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn generated_nonce_is_positive_int32() {
+        let mut rng = StdRng::seed_from_u64(0);
+        for _ in 0..10_000 {
+            let nonce = generate_nonce(&mut rng);
+            assert!(
+                i32::try_from(nonce).is_ok(),
+                "nonce {nonce:#x} does not fit in an Int32"
+            );
+        }
+    }
+
+    #[test]
+    fn as_req_kdc_body_nonce_is_minimal_der() {
+        for (nonce, expected) in [
+            (0x0009_a792, &[0xa7, 0x05, 0x02, 0x03, 0x09, 0xa7, 0x92][..]),
+            // An unrestricted random nonce (e.g. `next_u32()`) must stay within 4 octets.
+            (0x9abc_def0, &[0xa7, 0x06, 0x02, 0x04, 0x9a, 0xbc, 0xde, 0xf0][..]),
+        ] {
+            let body = generate_as_req_kdc_body(&GenerateAsReqOptions {
+                realm: "CRABKA.TEST",
+                username: "alice",
+                cname_type: NT_PRINCIPAL,
+                snames: &["krbtgt", "CRABKA.TEST"],
+                nonce,
+                hostname: "host",
+                context_requirements: ClientRequestFlags::empty(),
+            })
+            .expect("generate as-req body");
+
+            assert_eq!(picky_asn1_der::to_vec(&body.nonce).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn test_set_flags() {
@@ -881,38 +982,119 @@ mod tests {
     }
 
     #[test]
-    fn test_get_client_principal_realm_from_domain() {
-        let realm = get_client_principal_realm_impl(&[Path::new(KRB5_CONFIG_FILE_PATH)], "", "TBT.COM");
-        assert_eq!(realm, "TBT.COM");
-
-        let realm = get_client_principal_realm_impl(&[Path::new(KRB5_CONFIG_FILE_PATH)], "", "C1.DEV.TBT.COM");
-        assert_eq!(realm, "TEST.TBT.COM");
-
-        let realm = get_client_principal_realm_impl(&[Path::new(KRB5_CONFIG_FILE_PATH)], "", "P1.C2.DEV.TBT.COM");
-        assert_eq!(realm, "TEST.TBT.COM");
-
-        let realm = get_client_principal_realm_impl(&[Path::new(KRB5_CONFIG_FILE_PATH)], "", "DEV.TBT.COM");
-        assert_eq!(realm, "DEV.TBT.COM");
-
-        let realm = get_client_principal_realm_impl(&[Path::new(KRB5_CONFIG_FILE_PATH)], "", "TEST.TBT.COM");
-        assert_eq!(realm, "STAGE.TBT.COM");
+    fn extended_error_client_request_flag_maps_to_gss_flag() {
+        assert_eq!(
+            GssFlags::from(ClientRequestFlags::EXTENDED_ERROR).bits(),
+            GssFlags::GSS_C_EXTENDED_ERROR_FLAG.bits()
+        );
     }
 
     #[test]
-    fn test_get_client_principal_realm_from_username() {
-        let realm = get_client_principal_realm_impl(&[Path::new(KRB5_CONFIG_FILE_PATH)], "user@tbt.com", "");
-        assert_eq!(realm, "TBT.COM");
+    fn identify_client_request_flag_maps_to_gss_flag() {
+        assert_eq!(
+            GssFlags::from(ClientRequestFlags::IDENTIFY).bits(),
+            GssFlags::GSS_C_IDENTIFY_FLAG.bits()
+        );
+    }
 
-        let realm = get_client_principal_realm_impl(&[Path::new(KRB5_CONFIG_FILE_PATH)], "user@c1.dev.tbt.com", "");
-        assert_eq!(realm, "TEST.TBT.COM");
+    #[test]
+    fn extended_error_and_identify_client_request_flags_map_with_existing_flags() {
+        let request_flags =
+            ClientRequestFlags::EXTENDED_ERROR | ClientRequestFlags::IDENTIFY | ClientRequestFlags::MUTUAL_AUTH;
 
-        let realm = get_client_principal_realm_impl(&[Path::new(KRB5_CONFIG_FILE_PATH)], "user@p1.c2.dev.tbt.com", "");
-        assert_eq!(realm, "TEST.TBT.COM");
+        assert_eq!(
+            GssFlags::from(request_flags).bits(),
+            (GssFlags::GSS_C_EXTENDED_ERROR_FLAG | GssFlags::GSS_C_IDENTIFY_FLAG | GssFlags::GSS_C_MUTUAL_FLAG).bits()
+        );
+    }
 
-        let realm = get_client_principal_realm_impl(&[Path::new(KRB5_CONFIG_FILE_PATH)], "user@dev.tbt.com", "");
-        assert_eq!(realm, "DEV.TBT.COM");
+    fn cname_components(username: &str) -> Vec<String> {
+        let body = generate_as_req_kdc_body(&GenerateAsReqOptions {
+            realm: "CRABKA.TEST",
+            username,
+            cname_type: NT_PRINCIPAL,
+            snames: &["krbtgt", "CRABKA.TEST"],
+            nonce: 1,
+            hostname: "host",
+            context_requirements: ClientRequestFlags::empty(),
+        })
+        .expect("generate as-req body");
 
-        let realm = get_client_principal_realm_impl(&[Path::new(KRB5_CONFIG_FILE_PATH)], "user@test.tbt.com", "");
-        assert_eq!(realm, "STAGE.TBT.COM");
+        body.cname
+            .0
+            .expect("cname present")
+            .0
+            .name_string
+            .0
+            .0
+            .iter()
+            .map(|s| s.0.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn single_component_cname() {
+        assert_eq!(cname_components("alice"), vec!["alice".to_string()]);
+    }
+
+    #[test]
+    fn service_principal_cname_is_split_on_slash() {
+        // A `kafka/host` service principal must be encoded as two name-string
+        // components, or MIT KDC rejects the principal as unknown.
+        assert_eq!(
+            cname_components("kafka/host"),
+            vec!["kafka".to_string(), "host".to_string()]
+        );
+    }
+
+    #[test]
+    fn keytab_pa_datas_without_pre_auth_is_just_pac_request() {
+        let pa_datas = generate_pa_datas_for_as_req_with_key(&GenerateKeytabPaDataOptions {
+            key: vec![0u8; 32].into(),
+            key_enctype: CipherSuite::Aes256CtsHmacSha196,
+            with_pre_auth: false,
+        })
+        .expect("generate keytab pa-datas");
+        // No pre-auth requested: only the PA-PAC-REQUEST is emitted.
+        assert_eq!(pa_datas.len(), 1);
+    }
+
+    #[test]
+    fn keytab_pa_datas_with_pre_auth_includes_enc_timestamp() {
+        let pa_datas = generate_pa_datas_for_as_req_with_key(&GenerateKeytabPaDataOptions {
+            key: vec![0u8; 32].into(),
+            key_enctype: CipherSuite::Aes256CtsHmacSha196,
+            with_pre_auth: true,
+        })
+        .expect("generate keytab pa-datas");
+        // PA-ENC-TIMESTAMP plus PA-PAC-REQUEST.
+        assert_eq!(pa_datas.len(), 2);
+    }
+
+    #[test]
+    fn keytab_pa_data_uses_supplied_timestamp() {
+        let key = vec![0_u8; 32];
+        let timestamp = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap() + Duration::milliseconds(123);
+        let pa_datas = generate_pa_datas_for_as_req_with_key_at(
+            &GenerateKeytabPaDataOptions {
+                key: key.clone().into(),
+                key_enctype: CipherSuite::Aes256CtsHmacSha196,
+                with_pre_auth: true,
+            },
+            timestamp,
+        )
+        .unwrap();
+
+        let encrypted: EncryptedData = picky_asn1_der::from_bytes(&pa_datas[0].padata_data.0.0).unwrap();
+        let decrypted = CipherSuite::Aes256CtsHmacSha196
+            .cipher()
+            .decrypt(&key, PA_ENC_TIMESTAMP_KEY_USAGE, &encrypted.cipher.0.0)
+            .unwrap();
+        let decoded: PaEncTsEnc = picky_asn1_der::from_bytes(&decrypted).unwrap();
+        assert_eq!(
+            OffsetDateTime::try_from(decoded.patimestamp.0.0).unwrap(),
+            timestamp - Duration::milliseconds(123)
+        );
+        assert_eq!(decoded.pausec.0.unwrap().0.0, 123_000_u32.to_be_bytes());
     }
 }

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::ffi::CStr;
+use std::ptr;
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::{LazyLock, Mutex};
 
@@ -19,6 +20,7 @@ use winscard::{Error, ErrorKind, ScardContext as PivCardContext, SmartCardInfo, 
 
 use super::buf_alloc::{build_buf_request_type, build_buf_request_type_wide, save_out_buf, save_out_buf_wide};
 use crate::utils::into_raw_ptr;
+use crate::winscard::cache::GlobalScardCache;
 use crate::winscard::scard_handle::{
     WinScardContextHandle, raw_scard_context_handle_to_scard_context_handle, scard_context_to_winscard_context,
 };
@@ -37,6 +39,14 @@ const SMART_CARD_TYPE: &str = "WINSCARD_USE_SYSTEM_SCARD";
 // The same applies to the `SCardReleaseContext`. We need to ensure that the passed context handle was not
 // released before.
 static SCARD_CONTEXTS: LazyLock<Mutex<Vec<ScardContext>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Identifier of the emulated smart card.
+///
+/// We emulate one smart card, so all emulated smart card contexts represent the same card and
+/// thus share one identifier. The emulated smart card reports it in the CHUID, and all its cache
+/// items are scoped by it. It is generated once and remains the same for the process lifetime:
+/// the caller must see the same card every time it connects to the reader.
+static EMULATED_SCARD_ID: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 // This API table instance is only needed for the `SCardAccessStartedEvent` function. This function
 // doesn't accept any parameters, so we need a separate initialized API table to call the system API.
 #[cfg(target_os = "windows")]
@@ -66,7 +76,11 @@ fn release_context(context: ScardContext) {
 }
 
 fn create_emulated_smart_card_context() -> WinScardResult<Box<dyn WinScardContext>> {
-    Ok(Box::new(PivCardContext::new(SmartCardInfo::try_from_env()?)?))
+    Ok(Box::new(PivCardContext::new(
+        SmartCardInfo::try_from_env()?,
+        *EMULATED_SCARD_ID,
+        Box::new(GlobalScardCache),
+    )?))
 }
 
 /// The `SCardEstablishContext` function establishes the `resource manager context` (the scope) within
@@ -93,10 +107,9 @@ pub unsafe extern "system" fn SCardEstablishContext(
     let scard_context = if let Ok(use_system_card) = std::env::var(SMART_CARD_TYPE) {
         if use_system_card == "true" {
             info!("Creating system-provided smart card context");
-            Box::new(try_execute!(SystemScardContext::establish(
-                try_execute!(dw_scope.try_into()),
-                true
-            )))
+            Box::new(try_execute!(SystemScardContext::establish(try_execute!(
+                dw_scope.try_into()
+            ))))
         } else {
             info!("Creating emulated smart card context");
             try_execute!(create_emulated_smart_card_context())
@@ -108,7 +121,9 @@ pub unsafe extern "system" fn SCardEstablishContext(
 
     let scard_context = WinScardContextHandle::with_scard_context(scard_context);
 
-    let raw_ptr = into_raw_ptr(scard_context) as ScardContext;
+    let raw_ptr = into_raw_ptr(scard_context).expose_provenance();
+    #[allow(clippy::useless_conversion)]
+    let raw_ptr = try_execute!(raw_ptr.try_into(), ErrorKind::InvalidHandle);
     info!(new_established_context = ?raw_ptr);
     // SAFETY: The `context` is guaranteed to be non-null due to the prior check.
     unsafe {
@@ -134,11 +149,12 @@ pub unsafe extern "system" fn SCardReleaseContext(context: ScardContext) -> Scar
     check_handle!(context);
 
     if is_present(context) {
+        let context_ptr: *mut WinScardContextHandle = ptr::with_exposed_provenance_mut(context);
         // SAFETY:
         // - `context` is guaranteed to be non-null due to the prior check.
         // - `context` is allocated by `SCardEstablishContext` function.
         //   It guarantees that the pointer was allocated using `Box::into_raw`.
-        let _ = unsafe { Box::from_raw(context as *mut WinScardContextHandle) };
+        let _ = unsafe { Box::from_raw(context_ptr) };
         release_context(context);
 
         info!("Scard context has been successfully released");
@@ -844,7 +860,10 @@ static START_EVENT_HANDLE: LazyLock<Handle> = LazyLock::new(|| {
         })
         .unwrap_or_default();
 
-    handle.0.expose_provenance() as isize
+    #[expect(clippy::as_conversions, reason = "raw pointer to integer handle cast")]
+    {
+        handle.0.expose_provenance() as isize
+    }
 });
 
 /// The `SCardAccessStartedEvent` function returns an event handle when an event signals that the smart
@@ -1018,15 +1037,11 @@ pub unsafe extern "system" fn SCardGetStatusChangeA(
         unsafe { scard_context_to_winscard_context(context) }
     );
 
+    let len = try_execute!(c_readers.try_into(), ErrorKind::InsufficientBuffer);
     // SAFETY:
     // - `rg_reader_state` is guaranteed to be non-null due to the prior check.
     // - `rh_reader_state` is valid for both reads and writes for `c_readers` many bytes.
-    let c_reader_states = unsafe {
-        from_raw_parts_mut(
-            rg_reader_states,
-            try_execute!(c_readers.try_into(), ErrorKind::InsufficientBuffer),
-        )
-    };
+    let c_reader_states = unsafe { from_raw_parts_mut(rg_reader_states, len) };
     let mut reader_states = try_execute!(
         c_reader_states
             .iter()
@@ -1039,7 +1054,7 @@ pub unsafe extern "system" fn SCardGetStatusChangeA(
                     // - The memory region `c_reader.sz_reader` contains a valid null-terminator at the end of string.
                     // - The memory region `c_reader.sz_reader` points to is valid for reads of bytes up to and including null-terminator.
                     reader_name: unsafe { CStr::from_ptr(c_reader.sz_reader.cast()) }.to_string_lossy(),
-                    user_data: c_reader.pv_user_data as usize,
+                    user_data: c_reader.pv_user_data.expose_provenance(),
                     current_state: CurrentState::from_bits(c_reader.dw_current_state).unwrap_or_default(),
                     event_state: CurrentState::from_bits(c_reader.dw_event_state).unwrap_or_default(),
                     atr_len: c_reader.cb_atr.try_into()?,
@@ -1090,15 +1105,11 @@ pub unsafe extern "system" fn SCardGetStatusChangeW(
         unsafe { scard_context_to_winscard_context(context) }
     );
 
+    let len = try_execute!(c_readers.try_into(), ErrorKind::InsufficientBuffer);
     // SAFETY:
     // - `rg_reader_state` is guaranteed to be non-null due to the prior check.
     // - `rh_reader_state` is valid for both reads and writes for `c_readers` many bytes.
-    let c_reader_states = unsafe {
-        from_raw_parts_mut(
-            rg_reader_states,
-            try_execute!(c_readers.try_into(), ErrorKind::InsufficientBuffer),
-        )
-    };
+    let c_reader_states = unsafe { from_raw_parts_mut(rg_reader_states, len) };
     let mut reader_states = try_execute!(
         c_reader_states
             .iter()
@@ -1116,7 +1127,7 @@ pub unsafe extern "system" fn SCardGetStatusChangeW(
                             .to_string()
                             .map_err(Error::from)?,
                     ),
-                    user_data: c_reader.pv_user_data as usize,
+                    user_data: c_reader.pv_user_data.expose_provenance(),
                     current_state: CurrentState::from_bits(c_reader.dw_current_state).unwrap_or_default(),
                     event_state: CurrentState::from_bits(c_reader.dw_event_state).unwrap_or_default(),
                     atr_len: c_reader.cb_atr.try_into()?,
@@ -1346,6 +1357,11 @@ unsafe fn write_cache(
         // SAFETY: The `data` parameter is not null (checked above).
         unsafe { from_raw_parts(data, data_len.try_into()?) }.to_vec()
     };
+
+    debug!(
+        "Writing cache for card_id: {card_id:?}, freshness_counter: {freshness_counter}, lookup_name: {lookup_name:?}, data_len: {}",
+        data.len()
+    );
 
     context.write_cache(card_id, freshness_counter, lookup_name.to_owned(), data)
 }

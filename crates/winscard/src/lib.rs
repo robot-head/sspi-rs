@@ -9,6 +9,7 @@ extern crate tracing;
 mod macros;
 
 mod ber_tlv;
+mod cache;
 mod card_capability_container;
 mod chuid;
 mod compression;
@@ -33,6 +34,7 @@ use core::fmt;
 use core::num::TryFromIntError;
 
 pub use ber_tlv::ber_tlv_length_encoding;
+pub use cache::Cache;
 use iso7816_tlv::TlvError;
 use num_derive::{FromPrimitive, ToPrimitive};
 use picky::key::KeyError;
@@ -351,7 +353,10 @@ pub enum ErrorKind {
 
 impl From<ErrorKind> for u32 {
     fn from(value: ErrorKind) -> Self {
-        value as u32
+        #[expect(clippy::as_conversions, reason = "enum repr cast in From impl")]
+        {
+            value as u32
+        }
     }
 }
 
