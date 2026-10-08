@@ -1,15 +1,25 @@
 [package]
-name = "sspi"
+name = "krabka-sspi"
 version = "0.23.0"
 edition = "2024"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/devolutions/sspi-rs"
-repository = "https://github.com/devolutions/sspi-rs"
+homepage = "https://github.com/robot-head/sspi-rs"
+repository = "https://github.com/robot-head/sspi-rs"
 authors = ["Devolutions Inc. <infos@devolutions.net>"]
-description = "A Rust implementation of the Security Support Provider Interface (SSPI) API"
+description = "Temporary fork of the sspi crate (Devolutions' Rust SSPI implementation) carrying MIT Kerberos interoperability fixes, published for krabka; it will be deprecated once an upstream sspi release contains them"
 keywords = ["ntlm", "auth", "sspi", "windows", "kerberos"]
 rust-version = "1.93"
+include = [
+  "/src/**/*",
+  "/LICENSE-MIT",
+  "/LICENSE-APACHE",
+  "/README.md",
+  "/CHANGELOG.md",
+]
+
+[lib]
+name = "sspi"
 
 [workspace]
 resolver = "2"

@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [krabka-sspi 0.23.0] - unreleased
+
+First release of `krabka-sspi`, a temporary fork of upstream `sspi` 0.23.0
+published for krabka (see "About krabka-sspi" in the README). The library is
+upstream `sspi` 0.23.0 with these changes:
+
+### Bug Fixes
+
+- Accept an AS-REP whose encrypted part is tagged `EncTGSRepPart`, as MIT KDCs send and RFC 4120 section 5.4.2 permits ([#738](https://github.com/Devolutions/sspi-rs/pull/738))
+- Kerberos acceptor: take the encryption type from the service ticket's session key, so integrity-only GSS wrap tokens from MIT clients verify with the negotiated AES suite ([#738](https://github.com/Devolutions/sspi-rs/pull/738))
+- Map `GssApiMessageError::InvalidMechanismOid` to `ErrorKind::InvalidToken` ([#764](https://github.com/Devolutions/sspi-rs/pull/764))
+
+### Features
+
+- Re-export `SecretPrivateKey` from the crate root ([#764](https://github.com/Devolutions/sspi-rs/pull/764))
+
+### Build
+
+- Require `picky-krb` 0.13 (0.12.5 was yanked; 0.13.0 republishes it), `picky-asn1-der` 0.5.7 and `picky-asn1-x509` 0.15.5 ([#764](https://github.com/Devolutions/sspi-rs/pull/764))
+- Publish as `krabka-sspi` with library name `sspi`
+
+
+
 ## [[0.23.0](https://github.com/Devolutions/sspi-rs/compare/sspi-v0.22.1...sspi-v0.23.0)] - 2026-10-01
 
 ### <!-- 1 -->Features

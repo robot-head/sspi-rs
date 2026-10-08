@@ -8,6 +8,7 @@ homepage = "https://github.com/devolutions/sspi-rs"
 repository = "https://github.com/devolutions/sspi-rs"
 authors = ["Devolutions Inc. <infos@devolutions.net>"]
 description = "A Rust implementation of WinSCard"
+publish = false
 
 [features]
 std = ["tracing/std", "base64", "picky-asn1-der"]

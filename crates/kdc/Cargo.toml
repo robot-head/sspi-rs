@@ -6,6 +6,7 @@ readme = "README.md"
 license = "MIT/Apache-2.0"
 homepage = "https://github.com/devolutions/sspi-rs"
 repository = "https://github.com/devolutions/sspi-rs"
+publish = false
 authors = ["Devolutions Inc. <infos@devolutions.net>"]
 description = "A minimal Rust implementation of the KDC (Key Distribution Center)"
 

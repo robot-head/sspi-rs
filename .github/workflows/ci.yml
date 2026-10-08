@@ -167,6 +167,8 @@ jobs:
 
   build-native:
     name: Build native
+    # krabka-sspi fork: the NuGet packaging jobs run only in the upstream repository.
+    if: github.repository == 'Devolutions/sspi-rs'
     needs: formatting
     uses: ./.github/workflows/build-native.yml
 

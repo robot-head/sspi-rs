@@ -46,7 +46,7 @@ tracing = { version = "0.1", default-features = true }
 tracing-subscriber = { version = "0.3", features = ["std", "fmt", "local-time", "env-filter"] }
 
 libc = "0.2"
-sspi = { path = "..", default-features = false, features = ["network_client"] }
+sspi = { package = "krabka-sspi", path = "..", default-features = false, features = ["network_client"] }
 cryptoki = { version = "0.12", optional = true }
 widestring = "1.2"
 
@@ -61,13 +61,13 @@ embed-resource = "3"
 bitflags = { version = "2.11", optional = true }
 
 [target.'cfg(not(any(target_os="macos", target_os="ios", windows)))'.dependencies]
-sspi = { path = "..", default-features = false, features = ["dns_resolver"] }
+sspi = { package = "krabka-sspi", path = "..", default-features = false, features = ["dns_resolver"] }
 
 [build-dependencies]
 csbindgen = "1.9"
 
 [dev-dependencies]
-sspi = { path = "..", features = ["__test-data"] }
+sspi = { package = "krabka-sspi", path = "..", features = ["__test-data"] }
 
 [lints]
 workspace = true

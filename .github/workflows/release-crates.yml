@@ -14,6 +14,8 @@ jobs:
   # Create a PR with the new versions and changelog, preparing the next release.
   open-pr:
     name: Open release PR
+    # krabka-sspi fork: only the upstream repository publishes; see docs/krabka-sspi-release.md.
+    if: github.repository == 'Devolutions/sspi-rs'
     environment: cratesio-publish
     runs-on: ubuntu-latest
     concurrency:
@@ -38,6 +40,8 @@ jobs:
   # Release unpublished packages.
   release:
     name: Release crates
+    # krabka-sspi fork: only the upstream repository publishes; see docs/krabka-sspi-release.md.
+    if: github.repository == 'Devolutions/sspi-rs'
     environment: cratesio-publish
     runs-on: ubuntu-latest
     permissions:

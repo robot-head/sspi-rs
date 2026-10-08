@@ -18,6 +18,8 @@ on:
 jobs:
   preflight:
     name: Preflight
+    # krabka-sspi fork: only the upstream repository publishes; see docs/krabka-sspi-release.md.
+    if: github.repository == 'Devolutions/sspi-rs'
     runs-on: ubuntu-latest
     outputs:
       dry-run: ${{ steps.get-dry-run.outputs.dry-run }}
@@ -55,6 +57,8 @@ jobs:
           echo "::notice::Version: $PackageVersion"
 
   build-native:
+    # krabka-sspi fork: only the upstream repository publishes; see docs/krabka-sspi-release.md.
+    if: github.repository == 'Devolutions/sspi-rs'
     uses: ./.github/workflows/build-native.yml
 
   build-managed:

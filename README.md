@@ -1,5 +1,24 @@
 # sspi-rs
 
+> ## About krabka-sspi
+>
+> **This repository is published on crates.io as [`krabka-sspi`](https://crates.io/crates/krabka-sspi), a temporary fork of [devolutions/sspi-rs](https://github.com/Devolutions/sspi-rs) 0.23.0.**
+>
+> It carries the MIT Kerberos interoperability fixes from [devolutions/sspi-rs#738](https://github.com/Devolutions/sspi-rs/pull/738) and the fix from [devolutions/sspi-rs#764](https://github.com/Devolutions/sspi-rs/pull/764). It is published only so that the krabka crates, which need these fixes, can be released on crates.io.
+>
+> - We are upstreaming these changes to `sspi`.
+> - Once an upstream `sspi` release contains them, `krabka-sspi` will be deprecated: its crates.io README and description will point to [`sspi`](https://crates.io/crates/sspi), and its versions will be yanked.
+> - **Depend on upstream [`sspi`](https://crates.io/crates/sspi) unless you need these fixes now.**
+>
+> The library name is still `sspi`, so code keeps writing `use sspi::...`. To use the fork:
+>
+> ```toml
+> [dependencies]
+> sspi = { package = "krabka-sspi", version = "0.23.0" }
+> ```
+>
+> Switching back to upstream later means changing only that line. sspi-rs is developed by [Devolutions](https://github.com/Devolutions); all credit for the library belongs to its authors.
+
 [![](https://docs.rs/sspi/badge.svg)](https://docs.rs/sspi/) [![](https://img.shields.io/crates/v/sspi)](https://crates.io/crates/sspi)
 
 **sspi-rs** is a Rust implementation of [Security Support Provider Interface (SSPI)](https://docs.microsoft.com/en-us/windows/win32/rpc/security-support-provider-interface-sspi-). It ships with platform-independent implementations of [Security Support Providers (SSP)](https://docs.microsoft.com/en-us/windows/win32/rpc/security-support-providers-ssps-), and is able to utilize native Microsoft libraries when ran under Windows.
